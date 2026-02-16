@@ -1,0 +1,66 @@
+# ==============================================================================
+# OPERA DDPM Super-Resolution Configuration
+# ==============================================================================
+
+# --- I/O AND PATHS (OCTOPUS CLUSTER) ---
+RAW_OPERA_DATA_DIR: "/home/fquareng/work/curnagl-work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/OPERA"
+METADATA_DIR: "/home/fquareng/work/data/extremes/OPERA"
+PREPROCESSED_DATA_DIR: "/home/fquareng/work/data/extremes/OPERA/patches/precip"
+DEM_DATA_DIR: "/home/fquareng/work/data/extremes/OPERA/patches/dem"
+DEM_STATS: "/home/fquareng/work/data/extremes/OPERA/patches/dem/dem_stats.json"
+
+TRAIN_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/train_patches_metadata.txt"
+VAL_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/val_patches_metadata.txt"
+TEST_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/test_patches_metadata.txt"
+
+# --- PHYSICAL PREPROCESSING ---
+PRECIP_VAR_NAME: "TOT_PREC"
+PATCH_SIZE: 128
+DOWNSCALING_FACTOR: 6
+PIXEL_SIZE_KM: 2.0
+DRIZZLE_THRESHOLD: 0.1
+PERSISTENCE_THRESHOLD: 0.05  # TDA topological noise floor
+SPLIT_RATIOS:
+  train: 0.8
+  validation: 0.1
+  test: 0.1
+
+# --- DDPM TRAINING & HARDWARE ---
+EXPERIMENT_NAME: "DDPM_SR_Minkowski"
+DEVICE: "cuda"
+NUM_WORKERS: 4
+BATCH_SIZE: 128
+NUM_EPOCHS: 100
+PATIENCE: 15
+LEARNING_RATE: 1.0e-4
+
+# Dataset Balancing
+WET_DRY_RATIO: 1.0  # 1.0 = 1:1 ratio. Ensures the DDPM learns convective structures.
+
+# --- 4. TOPOLOGICAL TARGETS & EMULATOR ---
+# Climatological probability quantiles for Minkowski targets
+QUANTILE_LEVELS: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
+
+# Path to the frozen emulator predicting the topological targets
+EMULATOR_CHECKPOINT_PATH: "/home/fquareng/work/experiment_runs/GammaEmulator_v6_Constrained_SingleRun_2026-01-10_23-54-19/best_model_checkpoint.pth"
+
+# Required for load_emulator() instantiation
+ARCHITECTURE: "Constrained"  # 'Baseline', 'Lipschitz', 'Constrained'
+
+# --- MINKOWSKI CURRICULUM (EXPERIMENT TOGGLES) ---
+
+# For Experiment 1 (Vanilla DDPM): 
+# Set MINKOWSKI_TARGET_WEIGHT to 0.0 to completely disable the geometric loss.
+# For Experiment 2 (Minkowski DDPM): 
+# Set MINKOWSKI_TARGET_WEIGHT to 1.0 or your desired penalty lambda.
+MINKOWSKI_TARGET_WEIGHT: 0.0
+
+# The Curriculum (Ramps up the weight over N epochs after physical convergence)
+MINKOWSKI_WARMUP_EPOCHS: 5
+
+# The Time Gate (Do not compute Minkowski loss if diffusion timestep t >= threshold)
+MINKOWSKI_T_THRESHOLD: 250
+
+# The Trust Gate (Exponential decay based on emulator confidence). 
+# Run `calibrate_tau_log_space()` to find the exact aggressive/stable value.
+TRUST_TAU: 0.1

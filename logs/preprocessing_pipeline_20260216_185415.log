@@ -1,0 +1,48 @@
+Configuration file: /home/fquareng/work/Mink-DDPM/config.yaml
+Job starting on node34.octopoda at Mon Feb 16 18:54:15 CET 2026
+
+--- STAGE 1: Generating Patch Metadata and Timestamp Map ---
+Traceback (most recent call last):
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/generate_metadata.py", line 124, in <module>
+    main()
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/generate_metadata.py", line 88, in main
+    raise FileNotFoundError(f"No Zarr folders found in {RAW_OPERA_DATA_DIR}")
+FileNotFoundError: No Zarr folders found in /home/fquareng/work/curnagl-work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/OPERA
+--- STAGE 1 COMPLETE ---
+
+--- STAGE 2: Consolidating and Shuffling Metadata ---
+Consolidating daily metadata files...
+Traceback (most recent call last):
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/consolidate_and_split_shuf.py", line 84, in <module>
+    main()
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/consolidate_and_split_shuf.py", line 36, in main
+    raise FileNotFoundError(
+FileNotFoundError: No daily metadata files found in /home/fquareng/work/data/extremes/OPERA/temp_metadata
+--- STAGE 2 COMPLETE ---
+
+--- STAGE 3: Preprocessing Data into Final Zarr Store ---
+Loading timestamp map from file...
+Traceback (most recent call last):
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/preprocess_data.py", line 206, in <module>
+    main()
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/preprocess_data.py", line 130, in main
+    with open(map_path, "r") as f:
+FileNotFoundError: [Errno 2] No such file or directory: '/home/fquareng/work/data/extremes/OPERA/timestamp_map.json'
+--- STAGE 3 COMPLETE ---
+
+--- STAGE 4: Extracting Topological Gamma Targets ---
+--- Computing Global Climatological Thresholds (Empirical CDF) ---
+Traceback (most recent call last):
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/compute_gamma_targets.py", line 248, in <module>
+    main()
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/compute_gamma_targets.py", line 200, in main
+    physical_thresholds = compute_climatological_thresholds(zarr_path, quantiles)
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/compute_gamma_targets.py", line 23, in compute_climatological_thresholds
+    store = zarr.open(zarr_path, mode="r")
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/site-packages/zarr/convenience.py", line 137, in open
+    raise PathNotFoundError(path)
+zarr.errors.PathNotFoundError: nothing found at path ''
+--- STAGE 4 COMPLETE ---
+
+Cleaning up local Numba cache directory...
+--- PIPELINE FINISHED SUCCESSFULLY at Mon Feb 16 18:54:18 CET 2026 ---

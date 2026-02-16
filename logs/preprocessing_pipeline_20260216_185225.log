@@ -1,0 +1,144 @@
+Configuration file: /home/fquareng/work/Mink-DDPM/config.yaml
+Job starting on octopus.unil.ch at Mon Feb 16 18:52:26 CET 2026
+
+--- STAGE 1: Generating Patch Metadata and Timestamp Map ---
+Found 435 days to process with up to 4 parallel workers.
+Processing daily files:   0%|          | 0/435 [00:00<?, ?it/s]Processing daily files:   0%|          | 0/435 [00:01<?, ?it/s]
+Traceback (most recent call last):
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/generate_metadata.py", line 101, in main
+    for future in tqdm(
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/site-packages/tqdm/std.py", line 1181, in __iter__
+    for obj in iterable:
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/concurrent/futures/_base.py", line 245, in as_completed
+    waiter.event.wait(wait_timeout)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/threading.py", line 607, in wait
+    signaled = self._cond.wait(timeout)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/threading.py", line 320, in wait
+    waiter.acquire()
+KeyboardInterrupt
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/generate_metadata.py", line 124, in <module>
+    main()
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/generate_metadata.py", line 94, in main
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/concurrent/futures/_base.py", line 649, in __exit__
+    self.shutdown(wait=True)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/concurrent/futures/process.py", line 780, in shutdown
+    self._executor_manager_thread.join()
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/threading.py", line 1096, in join
+    self._wait_for_tstate_lock()
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/threading.py", line 1116, in _wait_for_tstate_lock
+    if lock.acquire(block, timeout):
+KeyboardInterrupt
+Exception ignored in atexit callback: <function _exit_function at 0x14f9228709d0>
+Traceback (most recent call last):
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/util.py", line 357, in _exit_function
+    p.join()
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/process.py", line 149, in join
+    res = self._popen.wait(timeout)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/popen_fork.py", line 43, in wait
+    return self.poll(os.WNOHANG if timeout == 0.0 else 0)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/popen_fork.py", line 27, in poll
+    pid, sts = os.waitpid(self.pid, flag)
+KeyboardInterrupt: 
+Process ForkProcess-1:
+Process ForkProcess-3:
+Process ForkProcess-2:
+Traceback (most recent call last):
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/concurrent/futures/process.py", line 240, in _process_worker
+    call_item = call_queue.get(block=True)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/queues.py", line 103, in get
+    res = self._recv_bytes()
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/connection.py", line 216, in recv_bytes
+    buf = self._recv_bytes(maxlength)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/connection.py", line 414, in _recv_bytes
+    buf = self._recv(4)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/connection.py", line 379, in _recv
+    chunk = read(handle, remaining)
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/concurrent/futures/process.py", line 240, in _process_worker
+    call_item = call_queue.get(block=True)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/queues.py", line 102, in get
+    with self._rlock:
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/synchronize.py", line 95, in __enter__
+    return self._semlock.__enter__()
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/concurrent/futures/process.py", line 240, in _process_worker
+    call_item = call_queue.get(block=True)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/queues.py", line 102, in get
+    with self._rlock:
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/synchronize.py", line 95, in __enter__
+    return self._semlock.__enter__()
+KeyboardInterrupt
+Process ForkProcess-4:
+Traceback (most recent call last):
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/concurrent/futures/process.py", line 240, in _process_worker
+    call_item = call_queue.get(block=True)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/queues.py", line 103, in get
+    res = self._recv_bytes()
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/connection.py", line 216, in recv_bytes
+    buf = self._recv_bytes(maxlength)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/connection.py", line 414, in _recv_bytes
+    buf = self._recv(4)
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/multiprocessing/connection.py", line 379, in _recv
+    chunk = read(handle, remaining)
+KeyboardInterrupt
+--- STAGE 1 COMPLETE ---
+
+--- STAGE 2: Consolidating and Shuffling Metadata ---
+Consolidating daily metadata files...
+Traceback (most recent call last):
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/consolidate_and_split_shuf.py", line 84, in <module>
+    main()
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/consolidate_and_split_shuf.py", line 36, in main
+    raise FileNotFoundError(
+FileNotFoundError: No daily metadata files found in /home/fquareng/work/data/extremes/OPERA/temp_metadata
+--- STAGE 2 COMPLETE ---
+
+--- STAGE 3: Preprocessing Data into Final Zarr Store ---
+Loading timestamp map from file...
+Traceback (most recent call last):
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/preprocess_data.py", line 206, in <module>
+    main()
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/preprocess_data.py", line 130, in main
+    with open(map_path, "r") as f:
+FileNotFoundError: [Errno 2] No such file or directory: '/home/fquareng/work/data/extremes/OPERA/timestamp_map.json'
+--- STAGE 3 COMPLETE ---
+
+--- STAGE 4: Extracting Topological Gamma Targets ---
+--- Computing Global Climatological Thresholds (Empirical CDF) ---
+Traceback (most recent call last):
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/compute_gamma_targets.py", line 248, in <module>
+    main()
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/compute_gamma_targets.py", line 200, in main
+    physical_thresholds = compute_climatological_thresholds(zarr_path, quantiles)
+  File "/home/fquareng/work/Mink-DDPM/data/preprocessing/compute_gamma_targets.py", line 23, in compute_climatological_thresholds
+    store = zarr.open(zarr_path, mode="r")
+  File "/work/fquareng/.micromamba/envs/dl/lib/python3.10/site-packages/zarr/convenience.py", line 137, in open
+    raise PathNotFoundError(path)
+zarr.errors.PathNotFoundError: nothing found at path ''
+--- STAGE 4 COMPLETE ---
+
+Cleaning up local Numba cache directory...
+--- PIPELINE FINISHED SUCCESSFULLY at Mon Feb 16 18:52:36 CET 2026 ---

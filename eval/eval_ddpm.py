@@ -1,0 +1,388 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import argparse
+import os
+import warnings
+from tqdm import tqdm
+
+# Import shared libraries
+import io_lib_sr as io_lib
+import metrics as metrics_lib
+import plotting_lib_sr as plotting_lib
+
+# Import DDPM specific modules
+from src.ddpm.model_ddpm import ContextUnet
+from src.ddpm.diffusion import Diffusion
+
+# Import Physics Logic
+from loss import compute_gamma_matrix_for_image, MinkowskiLoss
+from utils import load_emulator
+
+warnings.filterwarnings("ignore", message="No contour found", category=UserWarning)
+
+
+def load_ddpm_model(config, device, run_dir):
+    checkpoint_path = os.path.join(run_dir, "ddpm_latest.pth")
+    if not os.path.exists(checkpoint_path):
+        checkpoint_path = os.path.join(run_dir, "ddpm_best.pth")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"DDPM checkpoint not found at {checkpoint_path}")
+
+    print(f"Loading DDPM model from: {checkpoint_path}")
+    model = ContextUnet(in_channels=1, c_in_condition=2, device=device).to(device)
+
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    # Handle both direct state_dicts and checkpoint dictionaries
+    if "model_state_dict" in state_dict:
+        model.load_state_dict(state_dict["model_state_dict"])
+    else:
+        model.load_state_dict(state_dict)
+
+    model.eval()
+
+    diffusion = Diffusion(
+        noise_steps=1000,
+        beta_start=1e-4,
+        beta_end=0.02,
+        img_size=config.get("PATCH_SIZE", 128),
+        device=device,
+    )
+    return model, diffusion
+
+
+def compute_crps_ensemble(pred_ensemble, target):
+    term_1 = torch.mean(torch.abs(pred_ensemble - target), dim=1)
+    diffs = torch.abs(pred_ensemble.unsqueeze(2) - pred_ensemble.unsqueeze(1))
+    term_2 = torch.mean(diffs, dim=(1, 2))
+    crps_map = term_1 - 0.5 * term_2
+    return crps_map.mean(dim=(1, 2))
+
+
+def run_ddpm_crps_audit(
+    model,
+    diffusion,
+    loader,
+    device,
+    denormalizer_max_val,
+    drizzle_threshold,
+    n_ensemble=16,
+    n_batches=10,
+):
+    print(f"\n--- Running CRPS Audit (N={n_ensemble} samples per image) ---")
+    crps_scores = []
+
+    with torch.no_grad():
+        for i, (X, Y_true, _) in enumerate(tqdm(loader, desc="CRPS Ensemble")):
+            if i >= n_batches:
+                break
+
+            X, Y_true = X.to(device), Y_true.to(device)
+
+            # --- CRITICAL OOM FIX ---
+            # Subset the batch to prevent 2000+ image generations at once
+            max_batch_allowed = 128 // n_ensemble
+            B_sub = min(X.shape[0], max(1, max_batch_allowed))
+            X_sub = X[:B_sub]
+            Y_true_sub = Y_true[:B_sub]
+
+            # Repeat conditions K times -> Shape: [B_sub*K, C, H, W]
+            X_repeated = X_sub.repeat_interleave(n_ensemble, dim=0)
+
+            # Fast DDIM Sampling
+            samples_norm = diffusion.sample_ddim(
+                model, n=B_sub * n_ensemble, conditions=X_repeated, ddim_steps=50
+            )
+
+            # --- DOMAIN INVERSION [-1, 1] -> [0, 1] ---
+            samples_norm = (samples_norm.clamp(-1.0, 1.0) + 1.0) / 2.0
+            Y_true_norm = (Y_true_sub + 1.0) / 2.0
+
+            # Denormalize to Physical mm/h
+            samples_phys = torch.expm1(samples_norm * denormalizer_max_val)
+            samples_phys = samples_phys * (samples_phys > drizzle_threshold).float()
+            samples_ensemble = samples_phys.view(
+                B_sub, n_ensemble, Y_true.shape[2], Y_true.shape[3]
+            )
+
+            Y_phys = torch.expm1(Y_true_norm * denormalizer_max_val)
+            Y_phys = Y_phys * (Y_phys > drizzle_threshold).float()
+
+            batch_crps = compute_crps_ensemble(samples_ensemble, Y_phys)
+            crps_scores.extend(batch_crps.cpu().numpy())
+
+    avg_crps = np.mean(crps_scores)
+    print(f"Average CRPS (Ensemble={n_ensemble}): {avg_crps:.4f}")
+    return avg_crps
+
+
+def run_ddpm_prediction_loop(
+    model,
+    diffusion,
+    loader,
+    audit_criterion,
+    emulator,
+    device,
+    quantile_levels,
+    pixel_size_km,
+    denormalizer_max_val,
+    drizzle_threshold=0.1,
+):
+    model.eval()
+    if emulator:
+        emulator.eval()
+
+    all_preds_gamma_analytic, all_targets_gamma_analytic = [], []
+    all_preds_phys, all_targets_phys, all_inputs_phys = [], [], []
+    all_total_losses, all_mse_losses, all_surrogate_losses = [], [], []
+    all_fss, all_sal_S, all_sal_A, all_sal_L = [], [], [], []
+
+    audit_results = {
+        "L1_phys_err": [],
+        "L2_perc_err": [],
+        "L3_intr_err": [],
+        "consistency_gap": [],
+    }
+
+    mae_criterion = nn.L1Loss(reduction="none")
+    mse_criterion = nn.MSELoss(reduction="none")
+
+    print("\n--- Starting DDPM Inference (Fast DDIM) ---")
+    with torch.no_grad():
+        for batch_idx, (X, Y_true_norm, Y_gamma_log_target) in enumerate(tqdm(loader)):
+            X, Y_true_norm, Y_gamma_log_target = (
+                X.to(device),
+                Y_true_norm.to(device),
+                Y_gamma_log_target.to(device),
+            )
+
+            # 1. DDIM Sampling [-1, 1]
+            pred_X_norm = diffusion.sample_ddim(
+                model, n=X.shape[0], conditions=X, ddim_steps=50
+            )
+
+            # 2. DENORMALIZE [-1, 1] -> [0, 1] -> Physical mm/h
+            pred_X_shifted = (pred_X_norm.clamp(-1.0, 1.0) + 1.0) / 2.0
+            Y_true_shifted = (Y_true_norm + 1.0) / 2.0
+
+            X_shifted = (X[:, 0:1, :, :] + 1.0) / 2.0
+
+            pred_X_phys = torch.expm1(pred_X_shifted * denormalizer_max_val)
+            Y_true_phys = torch.expm1(Y_true_shifted * denormalizer_max_val)
+
+            X_phys = torch.expm1(X_shifted * denormalizer_max_val)
+
+            pred_X_phys = pred_X_phys * (pred_X_phys > drizzle_threshold).float()
+            Y_true_phys = Y_true_phys * (Y_true_phys > drizzle_threshold).float()
+
+            # Prepare Numpy Arrays [B, H, W]
+            pred_X_np = pred_X_phys.squeeze(1).cpu().numpy()
+            Y_true_np = Y_true_phys.squeeze(1).cpu().numpy()
+
+            # --- Compute Spatial Verification Metrics ---
+            eval_threshold = 1.0  # mm/h
+            eval_window = 5  # 5x5 pixel neighborhood
+
+            fss_batch = metrics_lib.compute_batch_fss(
+                pred_X_np, Y_true_np, eval_window, eval_threshold
+            )
+            S_batch, A_batch, L_batch = metrics_lib.compute_batch_sal(
+                pred_X_np, Y_true_np, eval_threshold, pixel_size_km**2
+            )
+
+            all_fss.append(fss_batch)
+            all_sal_S.append(S_batch)
+            all_sal_A.append(A_batch)
+            all_sal_L.append(L_batch)
+
+            # 3. Analytic Gamma Calculation
+            pred_X_np = pred_X_phys.cpu().numpy()
+            batch_gammas = [
+                compute_gamma_matrix_for_image(
+                    pred_X_np[i, 0], quantile_levels, pixel_size_km
+                )
+                for i in range(pred_X_np.shape[0])
+            ]
+
+            all_preds_gamma_analytic.append(np.array(batch_gammas))
+            all_targets_gamma_analytic.append(Y_gamma_log_target.cpu().numpy())
+
+            # 4. Pixel Losses
+            loss_mae_sample = mae_criterion(pred_X_phys, Y_true_phys).mean(
+                dim=(1, 2, 3)
+            )
+            loss_mse_sample = mse_criterion(pred_X_phys, Y_true_phys).mean(
+                dim=(1, 2, 3)
+            )
+            loss_surr_sample = torch.zeros_like(loss_mae_sample)
+
+            # 5. Emulator Consistency Audit (If in Minkowski Mode)
+            if emulator and audit_criterion:
+                gamma_pred_phys = emulator(pred_X_phys)
+                gamma_true_phys = emulator(Y_true_phys)
+
+                gamma_pred_log = torch.log1p(gamma_pred_phys)
+                gamma_true_log = torch.log1p(gamma_true_phys)
+
+                # Compute Distances using MinkowskiLoss
+                l1 = audit_criterion(gamma_pred_log, Y_gamma_log_target)
+                l2 = audit_criterion(gamma_pred_log, gamma_true_log)
+                l3 = audit_criterion(gamma_true_log, Y_gamma_log_target)
+                gap = torch.abs(l1 - l2)
+
+                loss_surr_sample = l1
+
+                audit_results["L1_phys_err"].append(l1.cpu().numpy())
+                audit_results["L2_perc_err"].append(l2.cpu().numpy())
+                audit_results["L3_intr_err"].append(l3.cpu().numpy())
+                audit_results["consistency_gap"].append(gap.cpu().numpy())
+            else:
+                nan_vec = np.full(X.shape[0], np.nan)
+                for k in audit_results:
+                    audit_results[k].append(nan_vec)
+
+            # 6. Collect Spatial Results
+            all_preds_phys.append(pred_X_phys.squeeze(1).cpu().numpy())
+            all_targets_phys.append(Y_true_phys.squeeze(1).cpu().numpy())
+            all_inputs_phys.append(X_phys.squeeze(1).cpu().numpy())
+
+            all_total_losses.append(loss_mae_sample.cpu().numpy())
+            all_mse_losses.append(loss_mse_sample.cpu().numpy())
+            all_surrogate_losses.append(loss_surr_sample.cpu().numpy())
+
+    # Concatenate all lists
+    return (
+        np.concatenate(all_preds_gamma_analytic, axis=0),
+        np.concatenate(all_targets_gamma_analytic, axis=0),
+        np.concatenate(all_preds_phys, axis=0),
+        np.concatenate(all_targets_phys, axis=0),
+        np.concatenate(all_inputs_phys, axis=0),
+        np.concatenate(all_total_losses, axis=0),
+        np.concatenate(all_mse_losses, axis=0),
+        np.concatenate(all_surrogate_losses, axis=0),
+        np.concatenate(all_fss, axis=0),
+        np.concatenate(all_sal_S, axis=0),
+        np.concatenate(all_sal_A, axis=0),
+        np.concatenate(all_sal_L, axis=0),
+        {k: np.concatenate(v, axis=0) for k, v in audit_results.items()},
+    )
+
+
+def main(run_dir):
+    config, device = io_lib.setup_evaluation(run_dir)
+
+    scaler_path = os.path.join(config["PREPROCESSED_DATA_DIR"], "precip_max_val.npy")
+    if os.path.exists(scaler_path):
+        PHYSICAL_MAX_VAL = float(np.load(scaler_path).item())
+    else:
+        PHYSICAL_MAX_VAL = 1.0
+
+    model, diffusion = load_ddpm_model(config, device, run_dir)
+    dem_stats = io_lib.load_dem_stats(config)
+    test_loader = io_lib.load_data(config, dem_stats, PHYSICAL_MAX_VAL)
+
+    QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
+    PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
+    EMULATOR_PATH = config.get("EMULATOR_CHECKPOINT_PATH", None)
+
+    # Vanilla vs. Minkowski Mode detection
+    emulator = None
+    audit_criterion = None
+    if EMULATOR_PATH and os.path.exists(EMULATOR_PATH):
+        print(f"Loading emulator for Minkowski Audit: {EMULATOR_PATH}")
+        emulator = load_emulator(EMULATOR_PATH, config, device)
+        audit_criterion = MinkowskiLoss(QUANTILE_LEVELS).to(device)
+    else:
+        print("Running in VANILLA MODE (No Emulator Audit).")
+
+    # Run Prediction Loop
+    (
+        all_preds_gamma,
+        all_targets_gamma,
+        all_preds_phys,
+        all_targets_phys,
+        all_inputs_phys,
+        all_total_losses,
+        all_mse_losses,
+        all_surrogate_losses,
+        all_fss,
+        all_sal_S,
+        all_sal_A,
+        all_sal_L,
+        audit_results,
+    ) = run_ddpm_prediction_loop(
+        model,
+        diffusion,
+        test_loader,
+        audit_criterion,
+        emulator,
+        device,
+        QUANTILE_LEVELS,
+        PIXEL_SIZE_KM,
+        PHYSICAL_MAX_VAL,
+        config.get("DRIZZLE_THRESHOLD", 0.1),
+    )
+
+    all_dems = [None] * len(all_preds_phys)
+
+    metrics_df = metrics_lib.create_metrics_dataframe(
+        all_preds_gamma,
+        all_targets_gamma,
+        all_inputs_phys,
+        all_targets_phys,
+        all_preds_phys,
+        all_dems,
+        all_total_losses,
+        all_mse_losses,
+        all_surrogate_losses,
+        QUANTILE_LEVELS,
+        PIXEL_SIZE_KM,
+    )
+
+    metrics_df["FSS"] = all_fss
+    metrics_df["SAL_Structure"] = all_sal_S
+    metrics_df["SAL_Amplitude"] = all_sal_A
+    metrics_df["SAL_Location"] = all_sal_L
+
+    metrics_df["L1_Physical_Error"] = audit_results["L1_phys_err"]
+    metrics_df["Consistency_Flag"] = audit_results["consistency_gap"]
+
+    group_metrics = metrics_lib.calculate_grouped_metrics(metrics_df)
+    per_feature_gamma_metrics = metrics_lib.calculate_per_feature_gamma_metrics(
+        metrics_df, QUANTILE_LEVELS
+    )
+
+    io_lib.save_metrics_text(run_dir, group_metrics, per_feature_gamma_metrics)
+    io_lib.save_metrics_npz(run_dir, metrics_df, per_feature_gamma_metrics)
+
+    if emulator:
+        pass_rate = (metrics_df["Consistency_Flag"] < 0.3).mean() * 100
+        print(f"\nEmulator Pass Rate (Flag < 0.3): {pass_rate:.2f}%")
+
+    avg_crps = run_ddpm_crps_audit(
+        model,
+        diffusion,
+        test_loader,
+        device,
+        PHYSICAL_MAX_VAL,
+        config.get("DRIZZLE_THRESHOLD", 0.1),
+    )
+
+    with open(os.path.join(run_dir, "crps_score.txt"), "w") as f:
+        f.write(f"Average CRPS (N=16, 10 Batches): {avg_crps:.6f}\n")
+
+    plotting_lib.plot_sample_comparisons_fixed(metrics_df, QUANTILE_LEVELS, run_dir)
+    plotting_lib.plot_per_feature_matrices(per_feature_gamma_metrics, run_dir)
+    plotting_lib.plot_gamma_mean_std_by_quantile(
+        metrics_df, group_metrics, QUANTILE_LEVELS, run_dir
+    )
+    plotting_lib.plot_metric_distributions(metrics_df, run_dir)
+
+    print("\nDDPM Evaluation Complete.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_dir", required=True)
+    args = parser.parse_args()
+    main(args.run_dir)
