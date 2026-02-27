@@ -155,19 +155,19 @@ def main():
             continue
 
         group = root.create_group(group_name)
-        group.create_array(
+        group.create_dataset(
             "original_precip",
             shape=(num_patches, patch_size, patch_size),
             chunks=(1, patch_size, patch_size),
             dtype="float32",
         )
-        group.create_array(
+        group.create_dataset(
             "interpolated_precip",
             shape=(num_patches, patch_size, patch_size),
             chunks=(1, patch_size, patch_size),
             dtype="float32",
         )
-        group.create_array(
+        group.create_dataset(
             "coarse_precip",
             shape=(num_patches, coarse_patch_size, coarse_patch_size),
             chunks=(1, coarse_patch_size, coarse_patch_size),

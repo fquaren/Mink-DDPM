@@ -2,7 +2,7 @@
 
 # --- CONFIGURATION ---
 # Adjust these paths to match your local workstation directory structure
-PROJECT_ROOT="/home/fquareng/work/Mink-DDPM"
+PROJECT_ROOT="/home/fquareng/work/ch2/Mink-DDPM"
 SCRIPT_DIR="${PROJECT_ROOT}/data/preprocessing"
 CONFIG_FILE="${PROJECT_ROOT}/config.yaml"
 

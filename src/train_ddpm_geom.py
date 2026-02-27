@@ -15,19 +15,23 @@ import argparse
 from scipy.stats import wasserstein_distance
 import copy
 import matplotlib.colors as mcolors
+import sys
+
+# --- Config & Path Setup ---
+parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if parent_path not in sys.path:
+    sys.path.insert(0, parent_path)
+
+config_path = os.path.join(parent_path, "config.yaml")
+with open(config_path, "r") as file:
+    config = yaml.safe_load(file)
 
 # Project imports
 from src.ddpm.model_ddpm import ContextUnet
 from src.ddpm.diffusion import Diffusion
 from data.dataset import SRDataset
 from src.loss import MinkowskiLoss
-from utils import load_emulator
-
-# --- Config ---
-parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-config_path = os.path.join(parent_path, "config.yaml")
-with open(config_path, "r") as file:
-    config = yaml.safe_load(file)
+from src.utils import load_emulator
 
 PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
 DEM_DATA_DIR = config["DEM_DATA_DIR"]
@@ -366,6 +370,7 @@ def main():
         METADATA_TRAIN,
         DEM_DATA_DIR,
         dem_stats,
+        scaler_max_val=denormalizer.max_val,
         split="train",
         subset_fraction=subset_fraction,
     )
@@ -374,6 +379,7 @@ def main():
         METADATA_VAL,
         DEM_DATA_DIR,
         dem_stats,
+        scaler_max_val=denormalizer.max_val,
         split="validation",
         subset_fraction=subset_fraction,
     )

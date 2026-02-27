@@ -10,21 +10,39 @@ import numba
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-
 @numba.jit(nopython=True)
 def find_valid_patches_numba(frame, patch_size):
-    """Uses Numba to JIT-compile a fast loop for finding valid patches and their max intensity."""
-    valid_patches_info = []
+    """Uses Numba to JIT-compile a fast loop with short-circuit NaN checking."""
     frame_h, frame_w = frame.shape
+    
+    # Pre-allocate lists for numba
+    out_y = []
+    out_x = []
+    out_max = []
+    
     for y in range(frame_h - patch_size + 1):
         for x in range(frame_w - patch_size + 1):
-            patch = frame[y : y + patch_size, x : x + patch_size]
-            if not np.isnan(patch).any():
-                # Extract the maximum physical intensity of this patch
-                patch_max = np.max(patch)
-                valid_patches_info.append((y, x, patch_max))
-    return valid_patches_info
-
+            has_nan = False
+            patch_max = -np.inf
+            
+            # Nested loop avoids creating array slices and allows short-circuiting
+            for dy in range(patch_size):
+                for dx in range(patch_size):
+                    val = frame[y + dy, x + dx]
+                    if np.isnan(val):
+                        has_nan = True
+                        break
+                    if val > patch_max:
+                        patch_max = val
+                if has_nan:
+                    break
+                    
+            if not has_nan:
+                out_y.append(y)
+                out_x.append(x)
+                out_max.append(patch_max)
+                
+    return out_y, out_x, out_max
 
 def scan_zarr_folder_for_patches(folder_path, precip_var_name, patch_size):
     """Worker function: Scans a single daily Zarr folder."""
@@ -32,9 +50,14 @@ def scan_zarr_folder_for_patches(folder_path, precip_var_name, patch_size):
     local_timestamp_map = {}
     try:
         with xr.open_zarr(folder_path, consolidated=True) as ds:
-            for t_idx in range(len(ds.time)):
-                frame = ds[precip_var_name].isel(time=t_idx).load().values
-                timestamp_dt_numpy = ds.time.isel(time=t_idx).values
+            # Bulk load the entire variable and time array to avoid loop overhead
+            data = ds[precip_var_name].load().values
+            times = ds.time.values
+            
+            for t_idx in range(len(times)):
+                frame = data[t_idx]
+                timestamp_dt_numpy = times[t_idx]
+                
                 timestamp_str = (
                     np.datetime_as_string(timestamp_dt_numpy, unit="s")
                     .replace("-", "")
@@ -42,16 +65,16 @@ def scan_zarr_folder_for_patches(folder_path, precip_var_name, patch_size):
                     .replace(":", "")
                 )
                 local_timestamp_map[timestamp_str] = (folder_path, t_idx)
-                valid_patches_in_frame = find_valid_patches_numba(frame, patch_size)
-                for y, x, patch_max in valid_patches_in_frame:
-                    # Append the max value to the metadata string
+                
+                y_coords, x_coords, max_vals = find_valid_patches_numba(frame, patch_size)
+                
+                for i in range(len(y_coords)):
                     local_coords_lines.append(
-                        f"{timestamp_str},{y},{x},{patch_max:.4f}\n"
+                        f"{timestamp_str},{y_coords[i]},{x_coords[i]},{max_vals[i]:.4f}\n"
                     )
     except Exception as e:
         print(f"Error processing folder {folder_path}: {e}")
     return local_coords_lines, local_timestamp_map
-
 
 def save_metadata_to_file(metadata, filepath):
     """Saves a list of metadata strings to a text file."""
@@ -59,7 +82,6 @@ def save_metadata_to_file(metadata, filepath):
     with open(filepath, "w") as f:
         f.writelines(metadata)
     print(f"Saved {len(metadata)} entries to {filepath}")
-
 
 def main():
     """Main script to orchestrate parallel scanning and result consolidation."""
@@ -118,7 +140,6 @@ def main():
     with open(map_path, "w") as f:
         json.dump(timestamp_map, f)
     print(f"\nSaved timestamp map with {len(timestamp_map)} entries to {map_path}")
-
 
 if __name__ == "__main__":
     main()

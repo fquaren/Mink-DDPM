@@ -3,7 +3,7 @@
 # ==============================================================================
 
 # --- I/O AND PATHS (OCTOPUS CLUSTER) ---
-RAW_OPERA_DATA_DIR: "/home/fquareng/work/curnagl-work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/OPERA"
+RAW_OPERA_DATA_DIR: "/home/fquareng/work/data/extremes/OPERA/raw/OPERA"
 METADATA_DIR: "/home/fquareng/work/data/extremes/OPERA"
 PREPROCESSED_DATA_DIR: "/home/fquareng/work/data/extremes/OPERA/patches/precip"
 DEM_DATA_DIR: "/home/fquareng/work/data/extremes/OPERA/patches/dem"
@@ -28,7 +28,8 @@ SPLIT_RATIOS:
 # --- DDPM TRAINING & HARDWARE ---
 EXPERIMENT_NAME: "DDPM_SR_Minkowski"
 DEVICE: "cuda"
-NUM_WORKERS: 4
+NUM_WORKERS: 8
+MAX_WORKERS: 10
 BATCH_SIZE: 128
 NUM_EPOCHS: 100
 PATIENCE: 15
