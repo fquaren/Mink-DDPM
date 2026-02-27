@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # --- CONFIGURATION ---
 # Adjust these paths to match your local workstation directory structure

@@ -176,7 +176,7 @@ def main():
 
         tasks = []
         for i, line in enumerate(lines):
-            timestamp_str, y_str, x_str = line.strip().split(",")
+            timestamp_str, y_str, x_str, _ = line.strip().split(",")
             patch_meta = (timestamp_str, int(y_str), int(x_str))
             tasks.append(
                 (i, patch_meta, timestamp_map, output_zarr_path, group_name, config)

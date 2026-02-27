@@ -219,7 +219,7 @@ def main():
 
         # Initialize Zarr array for Gamma targets
         if "gamma_targets" not in group:
-            group.create_array(
+            group.create_dataset(
                 "gamma_targets",
                 shape=(num_samples, 3, len(quantiles)),
                 chunks=(chunk_size, 3, len(quantiles)),

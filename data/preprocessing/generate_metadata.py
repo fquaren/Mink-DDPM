@@ -11,17 +11,12 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 @numba.jit(nopython=True)
-def find_valid_patches_numba(frame, patch_size):
-    """Uses Numba to JIT-compile a fast loop with short-circuit NaN checking."""
+def find_valid_patches_numba(frame, patch_size, stride):
     frame_h, frame_w = frame.shape
+    out_y, out_x, out_max = [], [], []
     
-    # Pre-allocate lists for numba
-    out_y = []
-    out_x = []
-    out_max = []
-    
-    for y in range(frame_h - patch_size + 1):
-        for x in range(frame_w - patch_size + 1):
+    for y in range(0, frame_h - patch_size + 1, stride):
+        for x in range(0, frame_w - patch_size + 1, stride):
             has_nan = False
             patch_max = -np.inf
             
@@ -66,7 +61,7 @@ def scan_zarr_folder_for_patches(folder_path, precip_var_name, patch_size):
                 )
                 local_timestamp_map[timestamp_str] = (folder_path, t_idx)
                 
-                y_coords, x_coords, max_vals = find_valid_patches_numba(frame, patch_size)
+                y_coords, x_coords, max_vals = find_valid_patches_numba(frame, patch_size, patch_size)  # Stride = patch_size for non-overlapping patches
                 
                 for i in range(len(y_coords)):
                     local_coords_lines.append(
