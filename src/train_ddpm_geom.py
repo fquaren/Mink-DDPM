@@ -43,7 +43,7 @@ LR = config["LEARNING_RATE"]
 EPOCHS = config["NUM_EPOCHS"]
 PATIENCE = config["PATIENCE"]
 NUM_WORKERS = config["NUM_WORKERS"]
-EXPERIMENT_NAME = "DDPM_SR_Geometric"
+EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "DDPM_SR_Minkowski")
 N_QUANTILES = len(config["QUANTILE_LEVELS"])
 
 # --- Minkowski Loss Configuration ---
@@ -224,38 +224,68 @@ def compute_geometric_loss_component(
 
 def save_sample_images(model, diffusion, loader, device, out_dir, epoch, denormalizer):
     model.eval()
-    try:
-        X, Y, _ = next(iter(loader))
-    except StopIteration:
+
+    selected_X = []
+    selected_Y = []
+    dry_count = 0
+    wet_count = 0
+
+    target_dry = 1
+    target_wet = 4
+    drizzle_threshold = 0.1  # physical mm/h
+
+    # Actively search the loader for the target distribution
+    for X_batch, Y_batch, _ in loader:
+        X_batch = X_batch.to(device, non_blocking=True)
+        Y_batch = Y_batch.to(device, non_blocking=True)
+
+        # Invert domain shift [-1, 1] -> [0, 1] to accurately assess physical precipitation
+        X_shifted = (X_batch[:, 0] + 1.0) / 2.0
+        X_phys = denormalizer.unnormalize_torch(X_shifted)
+        max_precip = X_phys.amax(dim=(1, 2))
+
+        for i in range(X_batch.size(0)):
+            if max_precip[i] <= drizzle_threshold and dry_count < target_dry:
+                selected_X.append(X_batch[i : i + 1])
+                selected_Y.append(Y_batch[i : i + 1])
+                dry_count += 1
+            elif max_precip[i] > drizzle_threshold and wet_count < target_wet:
+                selected_X.append(X_batch[i : i + 1])
+                selected_Y.append(Y_batch[i : i + 1])
+                wet_count += 1
+
+            if dry_count == target_dry and wet_count == target_wet:
+                break
+
+        if dry_count == target_dry and wet_count == target_wet:
+            break
+
+    # Fallback in the edge case of an extremely dry dataset subset
+    if not selected_X:
         return
 
-    X, Y = X.to(device, non_blocking=True), Y.to(device, non_blocking=True)
-    n_samples = min(5, X.shape[0])
-    X_sample = X[:n_samples]
-    Y_sample = Y[:n_samples]
+    X_sample = torch.cat(selected_X, dim=0)
+    Y_sample = torch.cat(selected_Y, dim=0)
+    n_samples = X_sample.size(0)
 
-    x_generated = torch.zeros(
-        (n_samples, 1, diffusion.img_size, diffusion.img_size), device=device
-    )
-    input_precip = X_sample[:, 0, :, :]
-    is_wet_mask = input_precip.amax(dim=(1, 2)) > 1e-6
-    wet_indices = torch.where(is_wet_mask)[0]
-    n_wet = len(wet_indices)
-
+    # Generate predictions for both dry and wet patches
     with torch.no_grad():
         with torch.amp.autocast("cuda"):
-            if n_wet > 0:
-                X_wet = X_sample[wet_indices]
-                gen_wet = diffusion.sample(model, n=n_wet, conditions=X_wet)
-                x_generated[wet_indices] = gen_wet
+            if hasattr(diffusion, "sample_ddim"):
+                x_generated = diffusion.sample_ddim(
+                    model, n=n_samples, conditions=X_sample, ddim_steps=50
+                )
+            else:
+                x_generated = diffusion.sample(model, n=n_samples, conditions=X_sample)
 
-    X_cpu = X_sample.float().cpu().numpy()
-    Y_cpu = Y_sample.float().cpu().numpy()
-    Gen_cpu = x_generated.float().cpu().numpy()
+    # Apply domain inversion [-1, 1] -> [0, 1] before scaling to physical units
+    X_norm = (X_sample[:, 0].float().cpu().numpy() + 1.0) / 2.0
+    Y_norm = (Y_sample[:, 0].float().cpu().numpy() + 1.0) / 2.0
+    Gen_norm = (x_generated[:, 0].float().cpu().clamp(-1.0, 1.0).numpy() + 1.0) / 2.0
 
-    X_phys = denormalizer.unnormalize(X_cpu[:, 0])
-    Y_phys = denormalizer.unnormalize(Y_cpu[:, 0])
-    Gen_phys = denormalizer.unnormalize(Gen_cpu[:, 0])
+    X_phys = denormalizer.unnormalize(X_norm)
+    Y_phys = denormalizer.unnormalize(Y_norm)
+    Gen_phys = denormalizer.unnormalize(Gen_norm)
 
     precip_cmap = copy.copy(plt.get_cmap("Blues"))
     precip_cmap.set_bad(color="lightgrey", alpha=1.0)

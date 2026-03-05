@@ -16,8 +16,9 @@ from src.ddpm.model_ddpm import ContextUnet
 from src.ddpm.diffusion import Diffusion
 
 # Import Physics Logic
-from loss import compute_gamma_matrix_for_image, MinkowskiLoss
-from utils import load_emulator
+from src.loss import MinkowskiLoss
+from src.utils import load_emulator
+from src.analytical_gamma import compute_gamma_matrix_for_image
 
 warnings.filterwarnings("ignore", message="No contour found", category=UserWarning)
 

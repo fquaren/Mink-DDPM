@@ -3,7 +3,8 @@ import torch
 import numpy as np
 import os
 
-from gamma_predictors import (
+
+from src.gamma_predictors import (
     BaselineCNN,
     LipschitzCNN,
     ConstrainedLipschitzCNN,

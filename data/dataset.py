@@ -138,8 +138,6 @@ class SRDataset(Dataset):
         gamma_phys = self.group["gamma_targets"][real_idx]
 
         # 2. Dynamic Normalization and Domain Shift
-        # Math: x_norm = clip(log1p(x_phys) / S, 0, 1)
-        # Math: x_scaled = x_norm * 2.0 - 1.0 -> Domain [-1, 1]
         target_log = np.log1p(target_phys)
         interp_log = np.log1p(interp_phys)
 
@@ -149,19 +147,11 @@ class SRDataset(Dataset):
         target_tensor = torch.from_numpy(target_norm).float().unsqueeze(0) * 2.0 - 1.0
         interp_tensor = torch.from_numpy(interp_norm).float().unsqueeze(0) * 2.0 - 1.0
 
-        # 3. Fetch DEM Context
-        ts, y_coord, x_coord, _ = self.metadata[real_idx]
-        dem_filename = f"dem_patch_y{y_coord:04d}_x{x_coord:04d}.npy"
-        dem_path = os.path.join(self.dem_patches_dir, dem_filename)
+        # --- CRITICAL FIX: Fetch DEM Context from Zarr ---
+        dem_patch = self.group["dem"][real_idx]
 
-        try:
-            dem_patch = np.load(dem_path)
-            dem_patch = (dem_patch - self.dem_mean) / (self.dem_std + 1e-8)
-        except FileNotFoundError:
-            # Fallback to zero-elevation if missing
-            dem_patch = np.zeros_like(target_phys)
-
-        # Assuming DEM is standardized (N(0,1)), we do NOT shift it to [-1, 1]
+        # Standardize using the computed stats
+        dem_patch = (dem_patch - self.dem_mean) / (self.dem_std + 1e-8)
         dem_tensor = torch.from_numpy(dem_patch).float().unsqueeze(0)
 
         # 4. Construct Conditioning Stack

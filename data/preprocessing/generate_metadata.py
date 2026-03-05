@@ -10,16 +10,17 @@ import numba
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+
 @numba.jit(nopython=True)
 def find_valid_patches_numba(frame, patch_size, stride):
     frame_h, frame_w = frame.shape
     out_y, out_x, out_max = [], [], []
-    
+
     for y in range(0, frame_h - patch_size + 1, stride):
         for x in range(0, frame_w - patch_size + 1, stride):
             has_nan = False
             patch_max = -np.inf
-            
+
             # Nested loop avoids creating array slices and allows short-circuiting
             for dy in range(patch_size):
                 for dx in range(patch_size):
@@ -31,13 +32,14 @@ def find_valid_patches_numba(frame, patch_size, stride):
                         patch_max = val
                 if has_nan:
                     break
-                    
+
             if not has_nan:
                 out_y.append(y)
                 out_x.append(x)
                 out_max.append(patch_max)
-                
+
     return out_y, out_x, out_max
+
 
 def scan_zarr_folder_for_patches(folder_path, precip_var_name, patch_size):
     """Worker function: Scans a single daily Zarr folder."""
@@ -48,11 +50,11 @@ def scan_zarr_folder_for_patches(folder_path, precip_var_name, patch_size):
             # Bulk load the entire variable and time array to avoid loop overhead
             data = ds[precip_var_name].load().values
             times = ds.time.values
-            
+
             for t_idx in range(len(times)):
                 frame = data[t_idx]
                 timestamp_dt_numpy = times[t_idx]
-                
+
                 timestamp_str = (
                     np.datetime_as_string(timestamp_dt_numpy, unit="s")
                     .replace("-", "")
@@ -60,9 +62,11 @@ def scan_zarr_folder_for_patches(folder_path, precip_var_name, patch_size):
                     .replace(":", "")
                 )
                 local_timestamp_map[timestamp_str] = (folder_path, t_idx)
-                
-                y_coords, x_coords, max_vals = find_valid_patches_numba(frame, patch_size, patch_size)  # Stride = patch_size for non-overlapping patches
-                
+
+                y_coords, x_coords, max_vals = find_valid_patches_numba(
+                    frame, patch_size, patch_size
+                )  # Stride = patch_size for non-overlapping patches
+
                 for i in range(len(y_coords)):
                     local_coords_lines.append(
                         f"{timestamp_str},{y_coords[i]},{x_coords[i]},{max_vals[i]:.4f}\n"
@@ -71,12 +75,14 @@ def scan_zarr_folder_for_patches(folder_path, precip_var_name, patch_size):
         print(f"Error processing folder {folder_path}: {e}")
     return local_coords_lines, local_timestamp_map
 
+
 def save_metadata_to_file(metadata, filepath):
     """Saves a list of metadata strings to a text file."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
         f.writelines(metadata)
     print(f"Saved {len(metadata)} entries to {filepath}")
+
 
 def main():
     """Main script to orchestrate parallel scanning and result consolidation."""
@@ -135,6 +141,7 @@ def main():
     with open(map_path, "w") as f:
         json.dump(timestamp_map, f)
     print(f"\nSaved timestamp map with {len(timestamp_map)} entries to {map_path}")
+
 
 if __name__ == "__main__":
     main()
