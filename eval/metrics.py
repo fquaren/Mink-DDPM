@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.ndimage import label, uniform_filter, center_of_mass
+import pandas as pd
 
 
 # --- Analytical FSS (Fractions Skill Score) Function ---
@@ -131,3 +132,51 @@ def compute_batch_sal(pred_batch, target_batch, threshold, pixel_area_km2=4.0):
         L_scores[i] = L
 
     return S_scores, A_scores, L_scores
+
+
+# --- Data Aggregation and Analysis Functions ---
+def create_metrics_dataframe(
+    preds_gamma,
+    targets_gamma,
+    inputs_phys,
+    targets_phys,
+    preds_phys,
+    dems,
+    total_losses,
+    mse_losses,
+    surrogate_losses,
+    quantile_levels,
+    pixel_size_km,
+):
+    """Compiles 1D metrics and stores multidimensional matrices safely."""
+    df = pd.DataFrame(
+        {
+            "Total_Loss": total_losses,
+            "MSE_Loss": mse_losses,
+            "Surrogate_Loss": surrogate_losses,
+        }
+    )
+
+    # Store multi-dimensional gamma arrays as lists within the series
+    # to bypass pandas dimensionality constraints.
+    df["pred_gamma"] = list(preds_gamma)
+    df["target_gamma"] = list(targets_gamma)
+
+    return df
+
+
+def calculate_grouped_metrics(metrics_df):
+    """Extracts mean statistics for scalar variables across the dataset."""
+    numeric_cols = metrics_df.select_dtypes(include=[np.number]).columns
+    return metrics_df[numeric_cols].mean().to_dict()
+
+
+def calculate_per_feature_gamma_metrics(metrics_df, quantile_levels):
+    """Computes MAE and MSE natively across the gamma quantile matrices."""
+    preds = np.stack(metrics_df["pred_gamma"].values)
+    targets = np.stack(metrics_df["target_gamma"].values)
+
+    return {
+        "gamma_mae": np.mean(np.abs(preds - targets), axis=0),
+        "gamma_mse": np.mean((preds - targets) ** 2, axis=0),
+    }
