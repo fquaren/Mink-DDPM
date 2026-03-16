@@ -1,2 +1,7 @@
 *logs*
 *cache*
+__pycache__
+*.log
+*.pt
+*.pth
+*.ckpt

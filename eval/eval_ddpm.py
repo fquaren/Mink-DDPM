@@ -5,6 +5,8 @@ import argparse
 import os
 import warnings
 from tqdm import tqdm
+import pandas as pd
+
 
 # Import shared libraries
 import io_lib_sr as io_lib
@@ -12,13 +14,13 @@ import metrics as metrics_lib
 import plotting_lib_sr as plotting_lib
 
 # Import DDPM specific modules
-from src.ddpm.model_ddpm import ContextUnet
-from src.ddpm.diffusion import Diffusion
+from models.SR.ddpm.ddpm import ContextUnet
+from models.SR.ddpm.diffusion import Diffusion
 
 # Import Physics Logic
 from src.loss import MinkowskiLoss
 from src.utils import load_emulator
-from src.analytical_gamma import compute_gamma_matrix_for_image
+from data.preprocessing.compute_gamma_targets import compute_gamma_matrix
 
 warnings.filterwarnings("ignore", message="No contour found", category=UserWarning)
 
@@ -127,6 +129,7 @@ def run_ddpm_prediction_loop(
     quantile_levels,
     pixel_size_km,
     denormalizer_max_val,
+    pers_thresh,
     drizzle_threshold=0.1,
 ):
     model.eval()
@@ -199,8 +202,8 @@ def run_ddpm_prediction_loop(
             # 3. Analytic Gamma Calculation
             pred_X_np = pred_X_phys.cpu().numpy()
             batch_gammas = [
-                compute_gamma_matrix_for_image(
-                    pred_X_np[i, 0], quantile_levels, pixel_size_km
+                compute_gamma_matrix(
+                    pred_X_np[i, 0], quantile_levels, pixel_size_km, pers_thresh
                 )
                 for i in range(pred_X_np.shape[0])
             ]
@@ -272,7 +275,9 @@ def run_ddpm_prediction_loop(
 def main(run_dir):
     config, device = io_lib.setup_evaluation(run_dir)
 
-    scaler_path = os.path.join(config["PREPROCESSED_DATA_DIR"], "precip_max_val.npy")
+    scaler_path = os.path.join(
+        config["PREPROCESSED_DATA_DIR"], "log_precip_max_val.npy"
+    )
     if os.path.exists(scaler_path):
         PHYSICAL_MAX_VAL = float(np.load(scaler_path).item())
     else:
@@ -321,6 +326,7 @@ def main(run_dir):
         QUANTILE_LEVELS,
         PIXEL_SIZE_KM,
         PHYSICAL_MAX_VAL,
+        config.get("PERSISTENCE_THRESHOLD", 0.05),
         config.get("DRIZZLE_THRESHOLD", 0.1),
     )
 
@@ -349,11 +355,12 @@ def main(run_dir):
     metrics_df["Consistency_Flag"] = audit_results["consistency_gap"]
 
     group_metrics = metrics_lib.calculate_grouped_metrics(metrics_df)
+    group_metrics_series = pd.Series(group_metrics)
     per_feature_gamma_metrics = metrics_lib.calculate_per_feature_gamma_metrics(
         metrics_df, QUANTILE_LEVELS
     )
 
-    io_lib.save_metrics_text(run_dir, group_metrics, per_feature_gamma_metrics)
+    io_lib.save_metrics_text(run_dir, group_metrics_series, per_feature_gamma_metrics)
     io_lib.save_metrics_npz(run_dir, metrics_df, per_feature_gamma_metrics)
 
     if emulator:

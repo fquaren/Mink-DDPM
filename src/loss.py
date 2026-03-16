@@ -10,10 +10,10 @@ class MinkowskiLoss(nn.Module):
             "quantiles", torch.tensor(quantile_levels, dtype=torch.float32)
         )
 
-    def forward(self, pred_log, target_log):
+    def forward(self, pred_log, target_log, a=1.0, b=1.0, c=1.0):
         """
         Calculates the 1-Wasserstein (L1 Minkowski) distance between the log-transformed
-        geometric quantile curves.
+        quantile curves.
 
         Args:
             pred_log: Tensor [B, 3, N_Quantiles]
@@ -31,6 +31,6 @@ class MinkowskiLoss(nn.Module):
         dist = torch.trapezoid(abs_diff, self.quantiles, dim=2)
 
         # Sum the three topological components (Area, Perimeter, Euler) per sample
-        total_dist = dist[:, 0] + dist[:, 1] + dist[:, 2]
+        total_dist = a * dist[:, 0] + b * dist[:, 1] + c * dist[:, 2]
 
-        return total_dist
+        return total_dist, dist[:, 0], dist[:, 1], dist[:, 2]

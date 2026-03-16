@@ -169,7 +169,7 @@ def worker_process_chunk(args):
     )
 
     pixel_size_km = config.get("PIXEL_SIZE_KM", 2.0)
-    pers_thresh = config.get("PERSISTENCE_THRESHOLD", 0.05)
+    pers_thresh = config.get("PERSISTENCE_THRESHOLD", 0.1)
 
     for i in range(precip_chunk.shape[0]):
         gamma_chunk[i] = compute_gamma_matrix(

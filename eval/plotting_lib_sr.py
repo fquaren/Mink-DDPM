@@ -13,13 +13,13 @@ import metrics as metrics_lib
 import plotting_lib_sr as plotting_lib
 
 # Import DDPM specific modules
-from src.ddpm.model_ddpm import ContextUnet
-from src.ddpm.diffusion import Diffusion
+from models.SR.ddpm.ddpm import ContextUnet
+from models.SR.ddpm.diffusion import Diffusion
 
 # Import Physics Logic
 from src.loss import MinkowskiLoss
 from src.utils import load_emulator
-from src.analytical_gamma import compute_gamma_matrix_for_image
+from data.preprocessing.compute_gamma_targets import compute_gamma_matrix
 
 warnings.filterwarnings("ignore", message="No contour found", category=UserWarning)
 
@@ -152,6 +152,7 @@ def run_ddpm_prediction_loop(
     quantile_levels,
     pixel_size_km,
     denormalizer,
+    pers_thresh,
     drizzle_threshold=0.1,
 ):
     model.eval()
@@ -218,8 +219,8 @@ def run_ddpm_prediction_loop(
             all_sal_L.append(L_batch)
 
             batch_gammas = [
-                compute_gamma_matrix_for_image(
-                    pred_X_np[i], quantile_levels, pixel_size_km
+                compute_gamma_matrix(
+                    pred_X_np[i], quantile_levels, pixel_size_km, pers_thresh
                 )
                 for i in range(pred_X_np.shape[0])
             ]
@@ -287,7 +288,7 @@ def main(run_dir):
     config, device = io_lib.setup_evaluation(run_dir)
 
     scaler_path = os.path.join(
-        config["PREPROCESSED_DATA_DIR"], "log_transformed_precip_max_val.npy"
+        config["PREPROCESSED_DATA_DIR"], "log_precip_max_val.npy"
     )
     denormalizer = DataDenormalizer(scaler_path)
 
@@ -332,6 +333,7 @@ def main(run_dir):
         QUANTILE_LEVELS,
         PIXEL_SIZE_KM,
         denormalizer,
+        config.get("PERSISTENCE_THRESHOLD", 0.05),
         config.get("DRIZZLE_THRESHOLD", 0.1),
     )
 

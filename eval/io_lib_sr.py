@@ -11,7 +11,7 @@ parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_path not in sys.path:
     sys.path.insert(0, parent_path)
 
-from data.dataset import SRDataset
+from data.dataset import DiffusionSRDataset
 
 
 def setup_evaluation(run_dir):
@@ -52,7 +52,7 @@ def load_dem_stats(config):
 
 
 def load_data(config, dem_stats, scaler_max_val):
-    """Loads test data loader for SRDataset using the strict domain constraints."""
+    """Loads test data loader for DiffusionSRDataset using the strict domain constraints."""
 
     # Critical check to ensure TEST_METADATA_FILE is present, as training configs
     # sometimes omit it in favor of VAL_METADATA_FILE.
@@ -64,7 +64,7 @@ def load_data(config, dem_stats, scaler_max_val):
     else:
         metadata_target = config["TEST_METADATA_FILE"]
 
-    test_dataset = SRDataset(
+    test_dataset = DiffusionSRDataset(
         preprocessed_data_dir=config["PREPROCESSED_DATA_DIR"],
         metadata_file=metadata_target,
         dem_patches_dir=config["DEM_DATA_DIR"],

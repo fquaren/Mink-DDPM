@@ -180,3 +180,27 @@ def calculate_per_feature_gamma_metrics(metrics_df, quantile_levels):
         "gamma_mae": np.mean(np.abs(preds - targets), axis=0),
         "gamma_mse": np.mean((preds - targets) ** 2, axis=0),
     }
+
+
+def compute_isoperimetric_violation(pred_log):
+    """
+    Computes the physical isoperimetric violation rate: P >= sqrt(4 * pi * A).
+    Expects predictions in log space [N, 3, Q], converts to physical space.
+    """
+    # Transform back to physical units
+    pred_phys = np.expm1(pred_log)
+
+    flat_A = pred_phys[:, 0, :].flatten()
+    flat_P = pred_phys[:, 1, :].flatten()
+
+    mask = flat_A > 1e-2
+    A_valid = flat_A[mask]
+    P_valid = flat_P[mask]
+
+    if len(A_valid) == 0:
+        return 0.0
+
+    P_min = np.sqrt(4 * np.pi * A_valid)
+    violation_mask = P_valid < (P_min - 1e-4)
+
+    return np.mean(violation_mask) * 100.0

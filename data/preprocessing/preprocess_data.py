@@ -2,43 +2,46 @@ import os
 import yaml
 import json
 import argparse
+import multiprocessing as mp
 import numpy as np
 import xarray as xr
 import zarr
+import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
-def filter_precip_bounds(arr, min_thresh, max_thresh):
-    """Applies both drizzle (lower) and declutter (upper) physical thresholds."""
-    arr_copy = arr.copy()
-    arr_copy[(arr_copy < min_thresh) | (arr_copy > max_thresh)] = 0.0
-    return arr_copy
+def filter_precip_bounds(tensor_arr, min_thresh, max_thresh):
+    """
+    Applies both drizzle (lower) and declutter (upper) physical thresholds.
+    Refactored to operate in-place on batched GPU tensors.
+    """
+    mask = (tensor_arr < min_thresh) | (tensor_arr > max_thresh)
+    tensor_arr[mask] = 0.0
+    return tensor_arr
 
 
-def coarsen_and_interpolate_conservative(arr, factor):
+def coarsen_and_interpolate_conservative(tensor_arr, factor):
     """
     Applies area-weighted block mean for coarsening and
     nearest-neighbor interpolation for strict mass conservation.
+    Refactored to accept a 4D tensor: (Batch, Channel, Height, Width).
     """
-    m, n = arr.shape
-    m_new, n_new = m // factor, n // factor
+    _, _, m, n = tensor_arr.shape
+    m_new, n_new = int(m / factor), int(n / factor)
 
-    # Block mean (Conservative decimation)
-    low_res = (
-        arr[: m_new * factor, : n_new * factor]
-        .reshape(m_new, factor, n_new, factor)
-        .mean(axis=(1, 3))
-    )
+    # Block mean (Conservative decimation supporting fractional binning)
+    coarse_tensor = F.adaptive_avg_pool2d(tensor_arr, output_size=(m_new, n_new))
 
-    # Nearest-neighbor interpolation (Strictly non-negative)
-    interpolated = np.kron(low_res, np.ones((factor, factor)))
+    # Nearest-neighbor interpolation (Strictly non-negative mass restoration)
+    interpolated_tensor = F.interpolate(coarse_tensor, size=(m, n), mode="nearest")
 
-    return low_res, interpolated
+    return coarse_tensor, interpolated_tensor
 
 
 def process_batch(batch_payload):
-    """Worker function to process a batch of patches to minimize I/O overhead."""
+    """Worker function optimized for vectorized GPU batching."""
     static_args = batch_payload["static"]
     tasks = batch_payload["tasks"]
     output_zarr_path, dem_path, group_name, config = static_args
@@ -50,15 +53,22 @@ def process_batch(batch_payload):
     target_zarr = zarr.open(output_zarr_path, mode="r+")
 
     try:
-        # Changed to open_zarr to bypass hdf5 posix locking
-        with xr.open_zarr(dem_path) as ds_dem:
-            # Load fully into memory for fast slicing
-            dem_memory = ds_dem["elevation"].load()
+        with xr.open_dataset(dem_path, engine="rasterio") as ds_dem:
+            dem_memory = (
+                ds_dem["band_data"]
+                .isel(band=0)
+                .drop_vars("band", errors="ignore")
+                .load()
+            )
     except Exception as e:
-        return [f"Critical error: Batch failed to load static DEM zarr store: {e}"]
+        return [f"Critical error: Batch failed to load static DEM file: {e}"]
 
-    # Cache for source precipitation datasets to avoid reopening the same day within a batch
     source_ds_cache = {}
+
+    # Memory allocation for batched GPU execution
+    valid_indices = []
+    precip_list = []
+    dem_list = []
 
     for task in tasks:
         idx, patch_meta, timestamp_map = task
@@ -80,9 +90,7 @@ def process_batch(batch_payload):
             ds = source_ds_cache[source_folder]
 
             if "y" not in ds.dims or "x" not in ds.dims:
-                results.append(
-                    f"Skipped index {idx}: Source {source_folder} dimensions missing."
-                )
+                results.append(f"Skipped index {idx}: Source dimensions missing.")
                 continue
 
             original_precip = (
@@ -98,9 +106,7 @@ def process_batch(batch_payload):
 
             h, w = original_precip.shape
             if h != patch_size or w != patch_size:
-                results.append(
-                    f"Skipped patch {patch_meta} at index {idx}: boundary truncation to shape ({h}, {w})"
-                )
+                results.append(f"Skipped patch at index {idx}: boundary truncation.")
                 continue
 
             # --- 3. Extract Elevation (DEM) from memory ---
@@ -111,45 +117,57 @@ def process_batch(batch_payload):
 
             dh, dw = dem_patch.shape
             if dh != patch_size or dw != patch_size:
-                results.append(
-                    f"Skipped patch {patch_meta} at index {idx}: DEM boundary truncation."
-                )
+                results.append(f"Skipped patch at index {idx}: DEM truncation.")
                 continue
 
-            # --- 4. Process Precipitation Physics ---
+            # Handle NaNs before appending
             original_precip[np.isnan(original_precip)] = 0.0
 
-            drizzle_thresh = config.get("DRIZZLE_THRESHOLD", 0.1)
-            declutter_thresh = config.get("DECLUTTER_THRESHOLD", 150.0)
-            filtered_precip = filter_precip_bounds(
-                original_precip, drizzle_thresh, declutter_thresh
-            )
-
-            low_res, interpolated = coarsen_and_interpolate_conservative(
-                filtered_precip, config["DOWNSCALING_FACTOR"]
-            )
-
-            # --- 5. Write to Zarr Store ---
-            target_zarr[f"{group_name}/original_precip"][idx] = filtered_precip.astype(
-                np.float32
-            )
-            target_zarr[f"{group_name}/interpolated_precip"][idx] = interpolated.astype(
-                np.float32
-            )
-            target_zarr[f"{group_name}/coarse_precip"][idx] = low_res.astype(np.float32)
-            target_zarr[f"{group_name}/dem"][idx] = dem_patch.astype(np.float32)
+            valid_indices.append(idx)
+            precip_list.append(original_precip)
+            dem_list.append(dem_patch)
 
         except Exception as e:
-            results.append(f"Error processing patch {patch_meta} at index {idx}: {e}")
+            results.append(f"Error extracting patch {patch_meta} at index {idx}: {e}")
+
+    # --- 4. Vectorized GPU Execution ---
+    if precip_list:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Stack into (Batch, Channels, Height, Width)
+        precip_tensor = torch.tensor(
+            np.stack(precip_list), dtype=torch.float32, device=device
+        ).unsqueeze(1)
+
+        drizzle_thresh = config.get("DRIZZLE_THRESHOLD", 0.1)
+        declutter_thresh = config.get("DECLUTTER_THRESHOLD", 150.0)
+
+        filtered_tensor = filter_precip_bounds(
+            precip_tensor, drizzle_thresh, declutter_thresh
+        )
+
+        coarse_tensor, interpolated_tensor = coarsen_and_interpolate_conservative(
+            filtered_tensor, config["DOWNSCALING_FACTOR"]
+        )
+
+        # Retrieve vectors from VRAM to CPU RAM
+        filtered_np = filtered_tensor.squeeze(1).cpu().numpy()
+        coarse_np = coarse_tensor.squeeze(1).cpu().numpy()
+        interpolated_np = interpolated_tensor.squeeze(1).cpu().numpy()
+
+        # --- 5. Write to Zarr Store ---
+        for i, target_idx in enumerate(valid_indices):
+            target_zarr[f"{group_name}/original_precip"][target_idx] = filtered_np[i]
+            target_zarr[f"{group_name}/interpolated_precip"][target_idx] = (
+                interpolated_np[i]
+            )
+            target_zarr[f"{group_name}/coarse_precip"][target_idx] = coarse_np[i]
+            target_zarr[f"{group_name}/dem"][target_idx] = dem_list[i]
 
     return results if results else None
 
 
 def compute_dem_stats(zarr_path, config):
-    """
-    Computes the global mean and standard deviation of the DEM patches
-    from the training split and saves them to a JSON file.
-    """
     print("\n--- Computing DEM Statistics ---")
     dataset = zarr.open(zarr_path, mode="r")
 
@@ -160,14 +178,12 @@ def compute_dem_stats(zarr_path, config):
     dem_data = dataset["train/dem"]
     chunk_size = 5000
 
-    # Use float64 accumulators to prevent numerical overflow
     count = 0
     sum_val = np.float64(0.0)
     sum_sq_val = np.float64(0.0)
 
     for i in tqdm(range(0, dem_data.shape[0], chunk_size), desc="Scanning DEM Data"):
         chunk = dem_data[i : i + chunk_size]
-        # Ignore NaNs if any slipped through
         valid_mask = ~np.isnan(chunk)
         valid_chunk = chunk[valid_mask]
 
@@ -197,10 +213,6 @@ def compute_dem_stats(zarr_path, config):
 
 
 def compute_global_scaler(zarr_path, config):
-    """
-    Computes the maximum log1p value from the training split
-    to be used for domain scaling [-1, 1] in the DDPM.
-    """
     print("\n--- Computing Global Training Scaler ---")
     dataset = zarr.open(zarr_path, mode="r")
 
@@ -221,7 +233,9 @@ def compute_global_scaler(zarr_path, config):
         if chunk_max > global_max:
             global_max = chunk_max
 
-    scaler_path = os.path.join(config["PREPROCESSED_DATA_DIR"], "precip_max_val.npy")
+    scaler_path = os.path.join(
+        config["PREPROCESSED_DATA_DIR"], "log_precip_max_val.npy"
+    )
     np.save(scaler_path, np.array([global_max]))
     print(f"Global Log1p Max saved to {scaler_path}: {global_max:.4f}")
 
@@ -255,7 +269,7 @@ def main():
 
     all_batched_payloads = {}
     patch_size = config["PATCH_SIZE"]
-    coarse_patch_size = patch_size // config["DOWNSCALING_FACTOR"]
+    coarse_patch_size = int(patch_size / config["DOWNSCALING_FACTOR"])
     batch_size = config.get("BATCH_SIZE", 1000)
 
     for group_name, path in metadata_paths.items():
@@ -268,7 +282,6 @@ def main():
 
         group = root.create_group(group_name)
 
-        # Initialize datasets using the Zarr v2 specification
         group.create_dataset(
             "original_precip",
             shape=(num_patches, patch_size, patch_size),
@@ -294,9 +307,8 @@ def main():
             dtype="float32",
         )
 
-        # Ensure the script explicitly targets a zarr directory even if config says .nc
-        dem_path_zarr = config["STATIC_DEM_PATH"].replace(".nc", ".zarr")
-        static_args = (output_zarr_path, dem_path_zarr, group_name, config)
+        dem_path = config["STATIC_DEM_PATH"]
+        static_args = (output_zarr_path, dem_path, group_name, config)
 
         dynamic_tasks = []
         for i, line in enumerate(lines):
@@ -337,4 +349,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # CRITICAL: Enforce spawn method for CUDA multiprocessing on Linux
+    mp.set_start_method("spawn", force=True)
     main()

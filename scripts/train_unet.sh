@@ -2,13 +2,13 @@
 
 # --- CONFIGURATION ---
 PROJECT_ROOT="/home/fquareng/work/ch2/Mink-DDPM" 
-SCRIPT_PATH="${PROJECT_ROOT}/src/train_ddpm.py"
+SCRIPT_PATH="${PROJECT_ROOT}/src/train_unet.py"
 
 # Logging setup
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="${PROJECT_ROOT}/logs"
 mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/ddpm_run_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/unet_run_${TIMESTAMP}.log"
 
 # --- HARDWARE SETTINGS ---
 # Explicitly set the GPU (Good practice even with 1 GPU)

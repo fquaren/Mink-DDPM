@@ -13,7 +13,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Project imports
-from data.dataset import SRDataset
+from data.dataset import DiffusionSRDataset
 from utils import load_emulator
 
 
@@ -50,7 +50,9 @@ def calibrate_tau_log_space():
     print(f"Using device: {device}")
 
     # Initialize Denormalizer
-    scaler_path = os.path.join(config["PREPROCESSED_DATA_DIR"], "precip_max_val.npy")
+    scaler_path = os.path.join(
+        config["PREPROCESSED_DATA_DIR"], "log_precip_max_val.npy"
+    )
     denormalizer = DataDenormalizer(scaler_path)
     print(f"Loaded Physical Max (Log-Space) Scaling Factor: {denormalizer.max_val:.4f}")
 
@@ -59,7 +61,7 @@ def calibrate_tau_log_space():
     dem_stats = (float(stats["dem_mean"]), float(stats["dem_std"]))
 
     print("Initializing Dataset...")
-    val_dataset = SRDataset(
+    val_dataset = DiffusionSRDataset(
         preprocessed_data_dir=config["PREPROCESSED_DATA_DIR"],
         metadata_file=config["VAL_METADATA_FILE"],
         dem_patches_dir=config["DEM_DATA_DIR"],
@@ -86,7 +88,7 @@ def calibrate_tau_log_space():
 
     print("Computing Emulator Errors...")
     with torch.no_grad():
-        # SRDataset returns: input_stack, target_tensor, target_gamma_tensor
+        # DiffusionSRDataset returns: input_stack, target_tensor, target_gamma_tensor
         for _, Y, Y_gamma_log in tqdm(loader):
             Y = Y.to(device)
             Y_gamma_log = Y_gamma_log.to(device)

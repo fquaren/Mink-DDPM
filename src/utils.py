@@ -4,7 +4,7 @@ import numpy as np
 import os
 
 
-from src.gamma_predictors import (
+from models.emulators.gamma_predictors import (
     BaselineCNN,
     LipschitzCNN,
     ConstrainedLipschitzCNN,
@@ -40,9 +40,7 @@ def load_emulator(checkpoint_path, config, device):
 
     # 1. Load Physical Scaler (Critical for Normalization)
     # The new models normalize inputs internally using this value.
-    scaler_path = config.get(
-        "MAX_LOG_PRECIP_FILE", os.path.join(PREPROCESSED_DATA_DIR, "precip_max_val.npy")
-    )
+    scaler_path = os.path.join(PREPROCESSED_DATA_DIR, "log_precip_max_val.npy")
 
     if os.path.exists(scaler_path):
         max_input_val = float(np.load(scaler_path))
@@ -77,7 +75,6 @@ def load_emulator(checkpoint_path, config, device):
             input_shape=input_shape,
             quantile_levels=config["QUANTILE_LEVELS"],
             pixel_area_km2=pixel_size_km**2,  # Pass Area (km^2), not length
-            max_input_val=max_input_val,
         )
 
     else:

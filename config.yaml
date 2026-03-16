@@ -8,19 +8,16 @@ METADATA_DIR: "/home/fquareng/work/data/extremes/OPERA"
 PREPROCESSED_DATA_DIR: "/home/fquareng/work/data/extremes/OPERA/patches/precip"
 DEM_DATA_DIR: "/home/fquareng/work/data/extremes/OPERA/patches/dem"
 DEM_STATS: "/home/fquareng/work/data/extremes/OPERA/patches/dem/dem_stats.json"
-STATIC_DEM_PATH: "/home/fquareng/work/data/extremes/OPERA/static_elevation.nc"
+STATIC_DEM_PATH: "/home/fquareng/work/data/extremes/OPERA/europe_dem_laea.tif"
 
 TRAIN_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/train_patches_metadata.txt"
 VAL_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/val_patches_metadata.txt"
 TEST_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/test_patches_metadata.txt"
 
-# GOOGLE EARTH ENGINE (GEE) SETTINGS
-EE_PROJECT_ID: 'opera-488710'
-
 # --- PHYSICAL PREPROCESSING ---
 PRECIP_VAR_NAME: "TOT_PREC"
 PATCH_SIZE: 128
-DOWNSCALING_FACTOR: 6
+DOWNSCALING_FACTOR: 12.5  # RCM to OPERA high resolution (25km / 2km)
 PIXEL_SIZE_KM: 2.0
 DRIZZLE_THRESHOLD: 0.1
 DECLUTTER_THRESHOLD: 150.0
@@ -33,12 +30,13 @@ SPLIT_RATIOS:
 # --- DDPM TRAINING & HARDWARE ---
 EXPERIMENT_NAME: "DDPM_SR_Minkowski"
 DEVICE: "cuda"
-NUM_WORKERS: 8
-MAX_WORKERS: 10
+NUM_WORKERS: 4
+MAX_WORKERS: 4
 BATCH_SIZE: 128
 NUM_EPOCHS: 25
 PATIENCE: 5
 LEARNING_RATE: 1.0e-4
+WEIGHT_DECAY: 1.0e-4
 
 # Dataset Balancing
 WET_DRY_RATIO: 1.0  # 1.0 = 1:1 ratio. Ensures the DDPM learns convective structures.

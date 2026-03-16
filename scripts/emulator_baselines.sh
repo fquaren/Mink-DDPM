@@ -2,13 +2,14 @@
 
 # --- CONFIGURATION ---
 PROJECT_ROOT="/home/fquareng/work/ch2/Mink-DDPM" 
-SCRIPT_PATH="${PROJECT_ROOT}/src/train_ddpm.py"
+SCRIPT_PATH="${PROJECT_ROOT}/eval/eval_emulator_baselines.py"
+CONFIG_PATH="${PROJECT_ROOT}/config.yaml"
 
 # Logging setup
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="${PROJECT_ROOT}/logs"
 mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/ddpm_run_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/emulator_baselines_run_${TIMESTAMP}.log"
 
 # --- HARDWARE SETTINGS ---
 # Explicitly set the GPU (Good practice even with 1 GPU)
@@ -23,6 +24,6 @@ echo "Logs will be saved to: $LOG_FILE"
 
 # We redirect both stdout (1) and stderr (2) to the log file
 source /home/fquareng/.bashrc
-micromamba run -n dl python "$SCRIPT_PATH" > "$LOG_FILE" 2>&1
+micromamba run -n dl python "$SCRIPT_PATH" "$CONFIG_PATH" > "$LOG_FILE" 2>&1
 
 echo "Training finished."
