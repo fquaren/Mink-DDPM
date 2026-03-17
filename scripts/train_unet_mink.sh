@@ -23,6 +23,6 @@ echo "Logs will be saved to: $LOG_FILE"
 
 # We redirect both stdout (1) and stderr (2) to the log file
 source /home/fquareng/.bashrc
-micromamba run -n dl python "$SCRIPT_PATH" --tune >> "$LOG_FILE" 2>&1
+micromamba run -n dl python "$SCRIPT_PATH" --tune --weight_geom=1.0 >> "$LOG_FILE" 2>&1
 
 echo "Training finished."

@@ -43,7 +43,7 @@ WD = config["WEIGHT_DECAY"]
 EPOCHS = config["NUM_EPOCHS"]
 PATIENCE = config["PATIENCE"]
 NUM_WORKERS = config["NUM_WORKERS"]
-EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "UNet_SR_Minkowski")
+EXPERIMENT_NAME = "UNet_SR_Minkowski"
 N_QUANTILES = len(config["QUANTILE_LEVELS"])
 
 # --- Minkowski Loss Configuration ---
@@ -381,7 +381,6 @@ def run_training(args, trial=None):
         mode="min",
         factor=0.5,
         patience=scheduler_patience,
-        verbose=not bool(trial),
     )
 
     scaler_enabled = device == "cuda"
@@ -612,6 +611,7 @@ def main():
     parser.add_argument(
         "--tune", action="store_true", help="Run optuna hyperparameter optimization"
     )
+    parser.add_argument("--weight_geom", type=float, default=GEOMETRIC_TARGET_WEIGHT)
     args = parser.parse_args()
 
     if args.tune:

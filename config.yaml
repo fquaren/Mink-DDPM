@@ -46,7 +46,8 @@ WET_DRY_RATIO: 1.0  # 1.0 = 1:1 ratio. Ensures the DDPM learns convective struct
 QUANTILE_LEVELS: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
 
 # Path to the frozen emulator predicting the topological targets
-EMULATOR_CHECKPOINT_PATH: "/home/fquareng/work/final_experiment_runs/GammaEmulator_v6_Constrained_SingleRun_2026-01-23_14-44-58/best_model_checkpoint.pth"
+EMULATOR_CHECKPOINT_PATH: "/home/fquareng/work/ch2/final_experiment_runs/GammaEmulator_v6_Constrained_T1_2026-03-13_08-22-37/best_model_checkpoint.pth" 
+#"/home/fquareng/work/final_experiment_runs/GammaEmulator_v6_Constrained_SingleRun_2026-01-23_14-44-58/best_model_checkpoint.pth"
 
 # Required for load_emulator() instantiation
 ARCHITECTURE: "Constrained"  # 'Baseline', 'Lipschitz', 'Constrained'
