@@ -83,8 +83,8 @@ class ZarrMixupDataset(Dataset):
         t_key = self.target_keys[source_idx]
 
         # Read specific index from zarr (Physical Units)
-        patch = self.group[d_key][local_idx]
-        target_phys = self.group[t_key][local_idx]
+        patch = self.group[d_key][local_idx].copy()
+        target_phys = self.group[t_key][local_idx].copy()
 
         # Log transformation and [0, 1] normalization
         # Note: the [0,1] scaling is done using the global max log-precip value computed during

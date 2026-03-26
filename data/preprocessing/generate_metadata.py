@@ -11,7 +11,7 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
-@numba.jit(nopython=True)
+@numba.jit(nopython=True, cache=False)
 def find_valid_patches_numba(frame, patch_size, stride):
     frame_h, frame_w = frame.shape
     out_y, out_x, out_max = [], [], []

@@ -61,7 +61,8 @@ def get_data_loaders(data_fraction=1.0):
 
     scaler_path = os.path.join(PREPROCESSED_DATA_DIR, "log_precip_max_val.npy")
     if os.path.exists(scaler_path):
-        scaler_val = float(np.load(scaler_path))
+        # --- CRITICAL FIX: Append .item() to extract the scalar safely ---
+        scaler_val = float(np.load(scaler_path).item())
     else:
         print(f"Scaler file not found at {scaler_path}. Using default value of 5.01.")
         scaler_val = 5.01

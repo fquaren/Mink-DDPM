@@ -273,7 +273,7 @@ def main(run_dir, architecture_type):
     )
 
     jacobian_norms = compute_jacobian_stats(model, test_loader, device, n_samples=200)
-    saliency_data = generate_saliency_samples(model, test_loader, device, n_examples=5)
+    # saliency_data = generate_saliency_samples(model, test_loader, device, n_examples=5)
 
     group_metrics_sample_wise = metrics_lib.calculate_grouped_metrics(metrics_df)
     per_feature_metrics = metrics_lib.calculate_per_feature_metrics(
@@ -282,8 +282,8 @@ def main(run_dir, architecture_type):
 
     # Plotting calls
     plotting_lib.plot_isoperimetric_check(all_preds_phys, run_dir)
-    plotting_lib.plot_dry_input_error(all_preds_phys, all_original_images, run_dir)
-    plotting_lib.plot_saliency_maps(saliency_data, run_dir)
+    # plotting_lib.plot_dry_input_error(all_preds_phys, all_original_images, run_dir)
+    # plotting_lib.plot_saliency_maps(saliency_data, run_dir)
     plotting_lib.plot_jacobian_spectrum(
         jacobian_data=jacobian_norms, output_dir=run_dir
     )

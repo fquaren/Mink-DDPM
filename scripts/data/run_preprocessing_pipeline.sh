@@ -29,6 +29,7 @@ DEM_SCRIPT="${SCRIPT_DIR}/download_dem.sh"
 METADATA_SCRIPT="${SCRIPT_DIR}/generate_metadata.py"
 CONSOLIDATE_SCRIPT="${SCRIPT_DIR}/consolidate_and_split_shuf.py"
 PREPROCESS_SCRIPT="${SCRIPT_DIR}/preprocess_data.py"
+THRESHOLDS_SCRIPT="${SCRIPT_DIR}/compute_persistence_thresholds.py"
 GAMMA_SCRIPT="${SCRIPT_DIR}/compute_gamma_targets.py"
 MIXUP_SCRIPT="${SCRIPT_DIR}/apply_mixup_augmentation.py"
 
@@ -64,14 +65,19 @@ source /home/fquareng/.bashrc
     # echo "--- STAGE 3 COMPLETE ---"
 
     # echo ""
-    # echo "--- STAGE 4: Extracting Topological Gamma Targets ---"
-    # micromamba run -n dl-stable python "${GAMMA_SCRIPT}" "${CONFIG_FILE}"
+    # echo "--- STAGE 4: Computing Empirical Persistence Thresholds ---"
+    # micromamba run -n dl-stable python "${THRESHOLDS_SCRIPT}" "${CONFIG_FILE}"
     # echo "--- STAGE 4 COMPLETE ---"
 
     echo ""
-    echo "--- STAGE 5: Applying Mixup Augmentation ---"
-    micromamba run -n dl-stable python "${MIXUP_SCRIPT}" "${CONFIG_FILE}"
+    echo "--- STAGE 5: Extracting Topological Gamma Targets ---"
+    micromamba run -n dl-stable python "${GAMMA_SCRIPT}" "${CONFIG_FILE}"
     echo "--- STAGE 5 COMPLETE ---"
+
+    echo ""
+    echo "--- STAGE 6: Applying Mixup Augmentation ---"
+    micromamba run -n dl-stable python "${MIXUP_SCRIPT}" "${CONFIG_FILE}"
+    echo "--- STAGE 6 COMPLETE ---"
 
     echo ""
     echo "Cleaning up local Numba cache directory..."

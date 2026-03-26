@@ -70,13 +70,12 @@ def compute_tda_persistence(prec_2d_np_clean):
 
 
 def compute_gamma_matrix(
-    prec_2d_data, physical_thresholds, pixel_size_km, persistence_threshold
+    prec_2d_data, physical_thresholds, pixel_size_km, thresh_b0, thresh_b1
 ):
     """
-    Computes the Gamma matrix (Area, Perimeter, beta_0, beta_1)
-    using the physical thresholds derived from the empirical CDF.
+    Computes the Gamma matrix (Area, Perimeter, Betti_0, Betti_1)
+    applying distinct persistence thresholds for components and holes.
     """
-    # Expanded to 4 features to accommodate Betti 1
     gamma_matrix = np.zeros((4, len(physical_thresholds)), dtype=np.float32)
     prec_2d_np_clean = np.nan_to_num(prec_2d_data, nan=-1.0)
 
@@ -97,7 +96,8 @@ def compute_gamma_matrix(
         persistence_0 = births_0 - deaths_0
         persistence_0[is_background_0] = np.inf
 
-        is_significant_0 = persistence_0 > persistence_threshold
+        # Apply specific B0 threshold
+        is_significant_0 = persistence_0 > thresh_b0
         pers_thresh_mask_0 = is_significant_0[:, np.newaxis]
 
         birth_thresh_mask_0 = births_0[:, np.newaxis] >= thresholds_broadcast_1d
@@ -132,8 +132,8 @@ def compute_gamma_matrix(
         deaths_1 = -pairs_d1[:, 1]
         persistence_1 = births_1 - deaths_1
 
-        # Betti 1 components inherently have finite death values in strict 2D sub-level sets
-        is_significant_1 = persistence_1 > persistence_threshold
+        # Apply specific B1 threshold
+        is_significant_1 = persistence_1 > thresh_b1
         pers_thresh_mask_1 = is_significant_1[:, np.newaxis]
 
         birth_thresh_mask_1 = births_1[:, np.newaxis] >= thresholds_broadcast_1d
@@ -171,7 +171,16 @@ def compute_gamma_matrix(
 
 def worker_process_chunk(args):
     """Worker function to process a chunk of images and save directly to Zarr."""
-    start_idx, end_idx, zarr_path, group_name, physical_thresholds, config = args
+    (
+        start_idx,
+        end_idx,
+        zarr_path,
+        group_name,
+        physical_thresholds,
+        config,
+        thresh_b0,
+        thresh_b1,
+    ) = args
 
     store = zarr.open(zarr_path, mode="r+")
     group = store[group_name]
@@ -182,11 +191,10 @@ def worker_process_chunk(args):
     )
 
     pixel_size_km = config.get("PIXEL_SIZE_KM", 2.0)
-    pers_thresh = config.get("PERSISTENCE_THRESHOLD", 0.1)
 
     for i in range(precip_chunk.shape[0]):
         gamma_chunk[i] = compute_gamma_matrix(
-            precip_chunk[i], physical_thresholds, pixel_size_km, pers_thresh
+            precip_chunk[i], physical_thresholds, pixel_size_km, thresh_b0, thresh_b1
         )
 
     group["gamma_targets"][start_idx:end_idx] = gamma_chunk
@@ -215,6 +223,26 @@ def main():
     )
     np.save(thresh_path, physical_thresholds)
 
+    # --- Load Empirical Persistence Thresholds ---
+    emp_thresh_path = os.path.join(
+        config["PREPROCESSED_DATA_DIR"], "persistence_thresholds.yaml"
+    )
+    if os.path.exists(emp_thresh_path):
+        print(
+            f"\n--- Loading Empirical Persistence Thresholds from {emp_thresh_path} ---"
+        )
+        with open(emp_thresh_path, "r") as f:
+            emp_thresh = yaml.safe_load(f)
+        thresh_b0 = emp_thresh.get("PERSISTENCE_THRESHOLD_B0", 0.1)
+        thresh_b1 = emp_thresh.get("PERSISTENCE_THRESHOLD_B1", 0.1)
+    else:
+        print(f"\n[WARNING] {emp_thresh_path} not found.")
+        print("Falling back to global PERSISTENCE_THRESHOLD from config.yaml.")
+        thresh_b0 = config.get("PERSISTENCE_THRESHOLD", 0.1)
+        thresh_b1 = thresh_b0
+
+    print(f"Applying Thresholds -> B0: {thresh_b0:.4f}, B1: {thresh_b1:.4f}")
+
     store = zarr.open(zarr_path, mode="r+")
     chunk_size = config.get("WORKER_CHUNK_SIZE", 500)
     print(f"\nUsing worker chunk size: {chunk_size} samples per worker process.")
@@ -227,11 +255,15 @@ def main():
         group = store[split]
         num_samples = group["original_precip"].shape[0]
 
+        # Save metadata to Zarr attributes for downstream transparency
+        group.attrs["persistence_threshold_b0"] = float(thresh_b0)
+        group.attrs["persistence_threshold_b1"] = float(thresh_b1)
+
         if "gamma_targets" not in group:
             group.create_dataset(
                 "gamma_targets",
-                shape=(num_samples, 4, len(quantiles)),  # Updated shape configuration
-                chunks=(chunk_size, 4, len(quantiles)),  # Updated chunks configuration
+                shape=(num_samples, 4, len(quantiles)),
+                chunks=(chunk_size, 4, len(quantiles)),
                 dtype="float32",
             )
 
@@ -239,7 +271,16 @@ def main():
         for start_idx in range(0, num_samples, chunk_size):
             end_idx = min(start_idx + chunk_size, num_samples)
             tasks.append(
-                (start_idx, end_idx, zarr_path, split, physical_thresholds, config)
+                (
+                    start_idx,
+                    end_idx,
+                    zarr_path,
+                    split,
+                    physical_thresholds,
+                    config,
+                    thresh_b0,
+                    thresh_b1,
+                )
             )
 
         max_workers = config.get("MAX_WORKERS", os.cpu_count() // 2)

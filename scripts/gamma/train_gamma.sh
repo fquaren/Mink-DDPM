@@ -5,6 +5,8 @@
 # DESCRIPTION: Runs 5 sequential batches. Each batch runs 3 architectures in parallel.
 # ==============================================================================
 
+export LD_LIBRARY_PATH=/work/fquareng/.micromamba/envs/dl-stable/lib:$LD_LIBRARY_PATH
+
 PROJECT_ROOT="/home/fquareng/work/ch2/Mink-DDPM"
 TRAIN_SCRIPT_PATH="${PROJECT_ROOT}/src/train_gamma.py"
 LOG_DIR="${PROJECT_ROOT}/logs/GammaEmulators_Ablation_$(date +%Y%m%d_%H%M%S)"
@@ -48,7 +50,7 @@ for seed in "${SEEDS[@]}"; do
         python "$TRAIN_SCRIPT_PATH" \
             --arch "$arch" \
             --optimize \
-            --data_fraction 1 \
+            --data_fraction .5 \
             --seed "$seed" \
             > "$LOG_FILE" 2>&1 &
             
