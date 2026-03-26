@@ -38,8 +38,6 @@ DEM_STATS = config["DEM_STATS"]
 METADATA_TRAIN = config["TRAIN_METADATA_FILE"]
 METADATA_VAL = config["VAL_METADATA_FILE"]
 BATCH_SIZE = config["BATCH_SIZE"]
-LR = config["LEARNING_RATE"]
-WD = config["WEIGHT_DECAY"]
 EPOCHS = config["NUM_EPOCHS"]
 PATIENCE = config["PATIENCE"]
 NUM_WORKERS = config["NUM_WORKERS"]
@@ -47,15 +45,11 @@ EXPERIMENT_NAME = "UNet_SR_Minkowski"
 N_QUANTILES = len(config["QUANTILE_LEVELS"])
 
 # --- Minkowski Loss Configuration ---
-GEOMETRIC_TARGET_WEIGHT = config.get("MINKOWSKI_TARGET_WEIGHT", 0.0)
 GEOMETRIC_WARMUP_EPOCHS = config.get("MINKOWSKI_WARMUP_EPOCHS", 5)
 TRUST_TAU = config.get("TRUST_TAU", 0.1)
 EMULATOR_PATH = config.get("EMULATOR_CHECKPOINT_PATH", "checkpoints/emulator_best.pth")
 
 
-# ------------------------------------------------------------------------------
-# 1. Helper Classes & Functions
-# ------------------------------------------------------------------------------
 class DataDenormalizer:
     def __init__(self, stats_path):
         try:
@@ -92,7 +86,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
+        self.val_loss_min = np.inf
         self.delta = delta
 
     def __call__(self, val_loss):
@@ -119,7 +113,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
+        self.val_loss_min = np.inf
 
     def state_dict(self):
         return {
@@ -153,25 +147,36 @@ def compute_geometric_loss_component(
     avg_trust_val = 1.0
     trust_weights = torch.ones(Y_pred_norm.shape[0], device=Y_pred_norm.device)
 
-    if compute_trust:
-        with torch.no_grad():
-            Y_phys = denormalizer.unnormalize_torch(Y_clean_norm)
-            Y_phys = Y_phys * (Y_phys > 0.1).float()
-            gamma_truth_phys = emulator(Y_phys)
-            gamma_truth_log_pred = torch.log1p(gamma_truth_phys)
-            diff_trust = (gamma_truth_log_pred - Y_gamma_log).float()
-            emu_error_sq = diff_trust.pow(2).mean(dim=(1, 2))
-            trust_weights = torch.exp(-float(TRUST_TAU) * emu_error_sq)
-            avg_trust_val = trust_weights.mean().item()
+    device_type = "cuda" if Y_pred_norm.device.type == "cuda" else "cpu"
 
-    pred_phys = denormalizer.unnormalize_torch(Y_pred_norm)
-    pred_phys = pred_phys * (pred_phys > 0.1).float()
-    pred_gamma_phys = emulator(pred_phys)
-    pred_gamma_log = torch.log1p(pred_gamma_phys)
-    raw_geom_loss, _, _, _ = criterion(pred_gamma_log, Y_gamma_log)
-    weight_factor = trust_weights.view(-1)
-    weighted_loss = raw_geom_loss * weight_factor
-    loss_geom = weighted_loss.mean()
+    with torch.autocast(device_type=device_type, enabled=False):
+        Y_pred_norm_f32 = Y_pred_norm.float()
+        Y_clean_norm_f32 = Y_clean_norm.float()
+        Y_gamma_log_f32 = Y_gamma_log.float()
+
+        if compute_trust:
+            with torch.no_grad():
+                Y_phys = denormalizer.unnormalize_torch(Y_clean_norm_f32)
+                Y_phys = Y_phys * (Y_phys > 0.1).float()
+                gamma_truth_phys = emulator(Y_phys)
+                gamma_truth_log_pred = torch.log1p(gamma_truth_phys)
+                # Ensure diff is calculated in f32
+                diff_trust = gamma_truth_log_pred - Y_gamma_log_f32
+                emu_error_sq = diff_trust.pow(2).mean(dim=(1, 2))
+                trust_weights = torch.exp(-float(TRUST_TAU) * emu_error_sq)
+                avg_trust_val = trust_weights.mean().item()
+
+        pred_phys = denormalizer.unnormalize_torch(Y_pred_norm_f32)
+        pred_phys = pred_phys * (pred_phys > 0.1).float()
+        pred_gamma_phys = emulator(pred_phys)
+        pred_gamma_log = torch.log1p(pred_gamma_phys)
+
+        # MinkowskiLoss returns: total_dist [B], area [B], perimeter [B], betti0 [B], betti1 [B]
+        batch_total_dist, _, _, _, _ = criterion(pred_gamma_log, Y_gamma_log_f32)
+
+        # Apply trust weights and average over batch
+        weighted_loss = batch_total_dist * trust_weights.view(-1)
+        loss_geom = weighted_loss.mean()
 
     return loss_geom, avg_trust_val
 
@@ -186,7 +191,6 @@ def save_sample_images(model, loader, device, out_dir, epoch, denormalizer):
     for X_batch, Y_batch, _ in loader:
         X_batch = X_batch.to(device, non_blocking=True)
         Y_batch = Y_batch.to(device, non_blocking=True)
-
         X_phys = denormalizer.unnormalize_torch(X_batch[:, 0])
         max_precip = X_phys.amax(dim=(1, 2))
 
@@ -199,7 +203,6 @@ def save_sample_images(model, loader, device, out_dir, epoch, denormalizer):
                 selected_X.append(X_batch[i : i + 1])
                 selected_Y.append(Y_batch[i : i + 1])
                 wet_count += 1
-
             if dry_count == target_dry and wet_count == target_wet:
                 break
         if dry_count == target_dry and wet_count == target_wet:
@@ -219,7 +222,6 @@ def save_sample_images(model, loader, device, out_dir, epoch, denormalizer):
     X_norm = X_sample[:, 0].float().cpu().numpy()
     Y_norm = Y_sample[:, 0].float().cpu().numpy()
     Gen_norm = x_generated[:, 0].float().cpu().clamp(0.0, 1.0).numpy()
-
     X_phys = denormalizer.unnormalize(X_norm)
     Y_phys = denormalizer.unnormalize(Y_norm)
     Gen_phys = denormalizer.unnormalize(Gen_norm)
@@ -233,7 +235,6 @@ def save_sample_images(model, loader, device, out_dir, epoch, denormalizer):
         return masked
 
     _, axs = plt.subplots(n_samples, 3, figsize=(18, 5 * n_samples), squeeze=False)
-
     for i in range(n_samples):
         img_in, img_target, img_gen = X_phys[i], Y_phys[i], Gen_phys[i]
         vmax = max(
@@ -241,19 +242,16 @@ def save_sample_images(model, loader, device, out_dir, epoch, denormalizer):
             1.0,
         )
         norm = mcolors.Normalize(vmin=0, vmax=vmax)
-
         axs[i, 0].imshow(
             mask_low_values(img_in), cmap=precip_cmap, norm=norm, origin="lower"
         )
         axs[i, 0].set_title(f"Input (LR) | Max: {np.nanmax(img_in):.2f}")
         axs[i, 0].axis("off")
-
         axs[i, 1].imshow(
             mask_low_values(img_gen), cmap=precip_cmap, norm=norm, origin="lower"
         )
         axs[i, 1].set_title(f"Generated (SR) | Max: {np.nanmax(img_gen):.2f}")
         axs[i, 1].axis("off")
-
         im3 = axs[i, 2].imshow(
             mask_low_values(img_target), cmap=precip_cmap, norm=norm, origin="lower"
         )
@@ -275,18 +273,14 @@ def compute_physical_metrics(real_batch, gen_batch, drizzle_threshold=0.1):
     real_batch = real_batch * (real_batch > drizzle_threshold).astype(float)
     gen_batch = gen_batch * (gen_batch > drizzle_threshold).astype(float)
     real_flat, gen_flat = real_batch.flatten(), gen_batch.flatten()
-
     if len(real_flat) == 0 or len(gen_flat) == 0:
         return {"wasserstein_dist": 0.0, "max_intensity_err": 0.0}
-
     wd = wasserstein_distance(real_flat, gen_flat)
     max_err = abs(np.max(real_flat) - np.max(gen_flat)) if len(real_flat) > 0 else 0
     return {"wasserstein_dist": wd, "max_intensity_err": max_err}
 
 
 def run_training(args, trial=None):
-    subset_fraction = args.data_percentage / 100.0
-
     if torch.cuda.is_available():
         device = "cuda"
         torch.set_float32_matmul_precision("high")
@@ -305,6 +299,10 @@ def run_training(args, trial=None):
         stats_dict = json.load(f)
     dem_stats = (float(stats_dict["dem_mean"]), float(stats_dict["dem_std"]))
 
+    params_path = args.params_path
+    with open(params_path, "r") as file:
+        unet_params = yaml.safe_load(file)
+
     denormalizer = DataDenormalizer(
         os.path.join(PREPROCESSED_DATA_DIR, "log_precip_max_val.npy")
     )
@@ -316,7 +314,8 @@ def run_training(args, trial=None):
         dem_stats,
         scaler_max_val=denormalizer.max_val,
         split="train",
-        subset_fraction=subset_fraction,
+        data_percentage=args.data_percentage,
+        load_in_ram=False,
     )
     val_dataset = DeterministicSRDataset(
         PREPROCESSED_DATA_DIR,
@@ -325,25 +324,21 @@ def run_training(args, trial=None):
         dem_stats,
         scaler_max_val=denormalizer.max_val,
         split="validation",
-        subset_fraction=subset_fraction,
+        data_percentage=args.data_percentage,
+        load_in_ram=False,
     )
 
-    # Initialize the sampler using the computed weights
-    # Replacement strategy ensures the epoch length matches the dataset size,
-    # while over-sampling wet instances and under-sampling dry instances.
     sampler = WeightedRandomSampler(
         weights=train_dataset.sample_weights,
         num_samples=len(train_dataset),
         replacement=True,
     )
-
-    # Create the dataloader. IMPORTANT: shuffle must be False when using a custom sampler.
     train_loader = DataLoader(
         dataset=train_dataset,
-        batch_size=32,
+        batch_size=BATCH_SIZE,
         sampler=sampler,
         shuffle=False,
-        num_workers=4,
+        num_workers=NUM_WORKERS,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -353,36 +348,38 @@ def run_training(args, trial=None):
         pin_memory=True,
     )
 
-    geometric_criterion = MinkowskiLoss(quantile_levels=config["QUANTILE_LEVELS"]).to(
-        device
+    GEOMETRIC_TARGET_WEIGHT = (
+        args.weight_geom
+        if args.weight_geom is not None
+        else config.get("MINKOWSKI_TARGET_WEIGHT", 0.0)
     )
-    emulator = load_emulator(EMULATOR_PATH, config, device)
-    emulator.eval()
-    for param in emulator.parameters():
-        param.requires_grad = False
+
+    emulator = None
+    geometric_criterion = None
+    if GEOMETRIC_TARGET_WEIGHT > 0.0:
+        geometric_criterion = MinkowskiLoss(
+            quantile_levels=config["QUANTILE_LEVELS"]
+        ).to(device)
+        emulator = load_emulator(EMULATOR_PATH, config, device)
+        emulator.eval()
+        for param in emulator.parameters():
+            param.requires_grad = False
 
     model = LogSpaceResidualUNet(in_channels=2, out_channels=1).to(device)
 
-    # --- Hyperparameter Sampling ---
     if trial:
         current_lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
         current_wd = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
     else:
-        current_lr = LR
-        current_wd = WD
+        current_lr = unet_params["lr"]
+        current_wd = unet_params["weight_decay"]
 
     optimizer = optim.AdamW(model.parameters(), lr=current_lr, weight_decay=current_wd)
     mse = nn.MSELoss()
-
-    # --- Scheduler Implementation ---
     scheduler_patience = max(1, PATIENCE // 2)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=scheduler_patience,
+        optimizer, mode="min", factor=0.5, patience=scheduler_patience
     )
-
     scaler_enabled = device == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
     early_stopper = EarlyStopping(patience=PATIENCE, verbose=not bool(trial))
@@ -411,7 +408,6 @@ def run_training(args, trial=None):
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
         start_epoch = checkpoint["epoch"]
         geometric_phase = checkpoint.get("geometric_phase", False)
         geometric_start_epoch = checkpoint.get("geometric_start_epoch", None)
@@ -420,6 +416,26 @@ def run_training(args, trial=None):
 
     for epoch in range(start_epoch, EPOCHS):
         model.train()
+        if (
+            GEOMETRIC_TARGET_WEIGHT > 0.0
+            and args.geom_start_epoch != -1
+            and epoch == args.geom_start_epoch
+            and not geometric_phase
+        ):
+            if not trial:
+                print(
+                    f"!!! Reached epoch {args.geom_start_epoch}. Triggering geometric curriculum !!!"
+                )
+            geometric_phase = True
+            geometric_start_epoch = epoch
+            early_stopper.reset()
+            optimizer = optim.AdamW(
+                model.parameters(), lr=current_lr, weight_decay=current_wd
+            )
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=scheduler_patience
+            )
+
         current_geom_weight = 0.0
         if geometric_phase and geometric_start_epoch is not None:
             progress = min(
@@ -434,8 +450,8 @@ def run_training(args, trial=None):
         current_lr_value = optimizer.param_groups[0]["lr"]
         pbar = tqdm(
             train_loader,
-            desc=f"Epoch {epoch+1}/{EPOCHS} [W={current_geom_weight:.3f}, LR={current_lr_value:.2e}]",
-            disable=bool(trial),
+            desc=f"Epoch {epoch+1}/{EPOCHS} [W={current_geom_weight:.3f}]",
+            mininterval=30.0,
         )
         running_loss, running_geom, running_trust = 0.0, 0.0, 0.0
 
@@ -445,18 +461,16 @@ def run_training(args, trial=None):
                 Y.to(device, non_blocking=True),
                 Y_gamma.to(device, non_blocking=True),
             )
-
             optimizer.zero_grad()
             with torch.amp.autocast(
                 "cuda" if device == "cuda" else "cpu", enabled=scaler_enabled
             ):
                 Y_pred = model(X)
                 loss_mse = mse(Y_pred, Y)
-
                 loss_geom = torch.tensor(0.0, device=device)
                 avg_trust_val = 1.0
 
-                if current_geom_weight > 0.0:
+                if current_geom_weight > 0.0 and emulator is not None:
                     loss_geom, avg_trust_val = compute_geometric_loss_component(
                         emulator,
                         geometric_criterion,
@@ -466,7 +480,6 @@ def run_training(args, trial=None):
                         Y_gamma,
                         compute_trust=True,
                     )
-
                 total_loss = loss_mse + (current_geom_weight * loss_geom)
 
             scaler.scale(total_loss).backward()
@@ -474,15 +487,11 @@ def run_training(args, trial=None):
             scaler.update()
 
             running_loss += loss_mse.item()
-            running_geom += loss_geom.item()
+            running_geom += (
+                loss_geom.item() if isinstance(loss_geom, torch.Tensor) else loss_geom
+            )
             running_trust += avg_trust_val
 
-            if not trial:
-                pbar.set_postfix(
-                    MSE=f"{loss_mse.item():.4f}", Geom=f"{loss_geom.item():.4f}"
-                )
-
-        # --- Validation Loop ---
         model.eval()
         val_mse_loss, val_geom_loss = 0.0, 0.0
         with torch.no_grad():
@@ -493,20 +502,22 @@ def run_training(args, trial=None):
                 ):
                     Y_pred = model(X)
                     loss_m = mse(Y_pred, Y)
-                    loss_g, _ = compute_geometric_loss_component(
-                        emulator,
-                        geometric_criterion,
-                        denormalizer,
-                        Y_pred,
-                        Y,
-                        Y_gamma,
-                        compute_trust=False,
-                    )
+                    loss_g = torch.tensor(0.0, device=device)
+                    if GEOMETRIC_TARGET_WEIGHT > 0.0 and emulator is not None:
+                        # Validation logic for new MinkowskiLoss
+                        loss_g, _ = compute_geometric_loss_component(
+                            emulator,
+                            geometric_criterion,
+                            denormalizer,
+                            Y_pred,
+                            Y,
+                            Y_gamma,
+                            compute_trust=False,
+                        )
                 val_mse_loss += loss_m.item()
                 val_geom_loss += loss_g.item()
 
         avg_val_mse = val_mse_loss / len(val_loader)
-
         scheduler.step(avg_val_mse)
 
         history["epoch"].append(epoch + 1)
@@ -515,25 +526,26 @@ def run_training(args, trial=None):
         history["geom_weight"].append(current_geom_weight)
         history["learning_rate"].append(current_lr_value)
 
-        checkpoint_latest = {
-            "epoch": epoch + 1,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict() if scaler_enabled else {},
-            "scheduler_state_dict": scheduler.state_dict(),
-            "early_stop_state": early_stopper.state_dict(),
-            "geometric_phase": geometric_phase,
-            "geometric_start_epoch": geometric_start_epoch,
-            "history": history,
-        }
-        torch.save(checkpoint_latest, os.path.join(out_dir, "unet_latest.pth"))
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict() if scaler_enabled else {},
+                "scheduler_state_dict": scheduler.state_dict(),
+                "early_stop_state": early_stopper.state_dict(),
+                "geometric_phase": geometric_phase,
+                "geometric_start_epoch": geometric_start_epoch,
+                "history": history,
+            },
+            os.path.join(out_dir, "unet_latest.pth"),
+        )
 
         if not trial and ((epoch + 1) % 5 == 0 or epoch == 0):
             save_sample_images(
                 model, val_loader, device, out_dir, epoch + 1, denormalizer
             )
 
-        # Physical Validation
         val_metrics = {"wd": []}
         with torch.no_grad():
             for i, (X_val, Y_val, _) in enumerate(val_loader):
@@ -544,11 +556,9 @@ def run_training(args, trial=None):
                 wet_idx = torch.where(is_wet)[0]
                 if len(wet_idx) == 0:
                     continue
-
                 Y_pred_wet = model(X_val[wet_idx])
                 Y_phys = denormalizer.unnormalize(Y_val[wet_idx, 0])
                 Gen_phys = denormalizer.unnormalize(Y_pred_wet[:, 0])
-
                 val_metrics["wd"].append(
                     compute_physical_metrics(Y_phys, Gen_phys)["wasserstein_dist"]
                 )
@@ -556,44 +566,27 @@ def run_training(args, trial=None):
         if val_metrics["wd"]:
             mean_wd = np.mean(val_metrics["wd"])
             best_wd_metric = min(best_wd_metric, mean_wd)
-
             if not trial:
                 print(f"  > Wasserstein Dist: {mean_wd:.4f}")
 
             if early_stopper(mean_wd):
-                if not geometric_phase:
-                    if not trial:
-                        print(
-                            "!!! Convergence Reached. Triggering Geometric Curriculum !!!"
+                if GEOMETRIC_TARGET_WEIGHT > 0.0 and not geometric_phase:
+                    if args.geom_start_epoch == -1:
+                        geometric_phase = True
+                        geometric_start_epoch = epoch + 1
+                        early_stopper.reset()
+                        optimizer = optim.AdamW(
+                            model.parameters(),
+                            lr=current_lr * 0.1,
+                            weight_decay=current_wd,
                         )
-                    geometric_phase = True
-                    geometric_start_epoch = epoch + 1
-                    early_stopper.reset()
-
-                    # --- METHOD 3 IMPLEMENTATION: STATE FLUSHING & LR RESET ---
-                    new_lr = current_lr * 0.1
-                    if not trial:
-                        print("!!! Re-initializing Optimizer and Scheduler !!!")
-                        print(
-                            f"Flushing historical momentum. Setting base LR to {new_lr:.2e}"
+                        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                            optimizer,
+                            mode="min",
+                            factor=0.5,
+                            patience=scheduler_patience,
                         )
-
-                    optimizer = optim.AdamW(
-                        model.parameters(), lr=new_lr, weight_decay=current_wd
-                    )
-                    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                        optimizer,
-                        mode="min",
-                        factor=0.5,
-                        patience=scheduler_patience,
-                        verbose=not bool(trial),
-                    )
-                    # ----------------------------------------------------------
                 else:
-                    if not trial:
-                        print(
-                            "!!! Convergence Reached in Geometric Phase. Stopping training."
-                        )
                     break
 
         if trial:
@@ -608,21 +601,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--data_percentage", type=float, default=100.0)
+    parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--weight_geom", type=float, default=0.0)
     parser.add_argument(
-        "--tune", action="store_true", help="Run optuna hyperparameter optimization"
+        "--params_path", type=str, default=os.path.join(parent_path, "unet_params.yaml")
     )
-    parser.add_argument("--weight_geom", type=float, default=GEOMETRIC_TARGET_WEIGHT)
+    parser.add_argument("--geom_start_epoch", type=int, default=-1)
     args = parser.parse_args()
 
     if args.tune:
-        print("Starting hyperparameter optimization study...")
         study = optuna.create_study(direction="minimize")
-        study.optimize(lambda trial: run_training(args, trial), n_trials=20)
-
-        print("\nOptimization complete.")
-        print("Best parameters:")
-        for key, value in study.best_params.items():
-            print(f"  {key}: {value}")
+        study.optimize(lambda trial: run_training(args, trial), n_trials=10)
+        with open(os.path.join(parent_path, "unet_params.yaml"), "w") as f:
+            yaml.dump(study.best_params, f)
     else:
         run_training(args)
 

@@ -23,7 +23,7 @@ def worker_process_mixup_chunk(args):
 
     N, H, W = real_chunk.shape
     mixed_chunk_out = np.zeros((N, H, W), dtype=np.float32)
-    gamma_chunk = np.zeros((N, 3, len(physical_thresholds)), dtype=np.float32)
+    gamma_chunk = np.zeros((N, 4, len(physical_thresholds)), dtype=np.float32)
 
     mixup_alpha = config.get("MIXUP_ALPHA", 0.2)
     noise_std = config.get("NOISE_STD", 0.05)
@@ -98,15 +98,14 @@ def main():
     if "mixup_gamma_targets" not in train_group:
         train_group.create_dataset(
             "mixup_gamma_targets",
-            shape=(num_samples, 3, num_quantiles),
-            chunks=(chunk_size, 3, num_quantiles),
+            shape=(num_samples, 4, num_quantiles),
+            chunks=(chunk_size, 4, num_quantiles),
             dtype="float32",
         )
 
     tasks = []
     for start_idx in range(0, num_samples, chunk_size):
         end_idx = min(start_idx + chunk_size, num_samples)
-        # scaler_val dependency removed
         tasks.append((start_idx, end_idx, zarr_path, physical_thresholds, config))
 
     max_workers = config.get("MAX_WORKERS", os.cpu_count() // 2)

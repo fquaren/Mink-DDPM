@@ -8,7 +8,7 @@
 PROJECT_ROOT="/home/fquareng/work/ch2/Mink-DDPM"
 TRAIN_SCRIPT_PATH="${PROJECT_ROOT}/src/train_gamma.py"
 LOG_DIR="${PROJECT_ROOT}/logs/GammaEmulators_Ablation_$(date +%Y%m%d_%H%M%S)"
-ENV_NAME="dl"
+ENV_NAME="dl-stable"
 
 mkdir -p "$LOG_DIR"
 
@@ -18,7 +18,7 @@ source ~/.bashrc
 micromamba activate "$ENV_NAME"
 
 ARCHS=("Baseline" "Lipschitz" "Constrained") 
-SEEDS=(42)
+SEEDS=(42)  # You can add more seeds for a more robust study, e.g., (42 123 2024)
 
 # Counter for visual progress
 BATCH_NUM=1

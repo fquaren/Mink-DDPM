@@ -27,7 +27,6 @@ def compute_climatological_thresholds(zarr_path, quantiles, drizzle_threshold=0.
     train_data = store["train/original_precip"]
     chunk_size = 5000
 
-    # We sample a large subset of physical values to estimate the CDF
     rng = np.random.default_rng(seed=42)
     indices = np.arange(train_data.shape[0])
     rng.shuffle(indices)
@@ -41,11 +40,9 @@ def compute_climatological_thresholds(zarr_path, quantiles, drizzle_threshold=0.
             break
 
         chunk_indices = indices[i : i + chunk_size]
-        # Sort indices to optimize Zarr read operations
         chunk_indices = np.sort(chunk_indices)
         chunk = train_data.oindex[chunk_indices]
 
-        # Isolate wet pixels
         wet_mask = chunk > drizzle_threshold
         wet_vals = chunk[wet_mask]
 
@@ -55,7 +52,6 @@ def compute_climatological_thresholds(zarr_path, quantiles, drizzle_threshold=0.
     all_wet_pixels = np.concatenate(sampled_wet_pixels)
     print(f"Aggregated {len(all_wet_pixels)} wet pixels.")
 
-    # Compute exact physical thresholds corresponding to the probability quantiles
     physical_thresholds = np.quantile(all_wet_pixels, quantiles)
 
     for q, t in zip(quantiles, physical_thresholds):
@@ -77,67 +73,85 @@ def compute_gamma_matrix(
     prec_2d_data, physical_thresholds, pixel_size_km, persistence_threshold
 ):
     """
-    Computes the Gamma matrix (Area, Perimeter, Euler Characteristic)
+    Computes the Gamma matrix (Area, Perimeter, beta_0, beta_1)
     using the physical thresholds derived from the empirical CDF.
     """
-    gamma_matrix = np.zeros((3, len(physical_thresholds)), dtype=np.float32)
+    # Expanded to 4 features to accommodate Betti 1
+    gamma_matrix = np.zeros((4, len(physical_thresholds)), dtype=np.float32)
     prec_2d_np_clean = np.nan_to_num(prec_2d_data, nan=-1.0)
 
-    # --- 1. TDA Calculation for Euler Characteristic (Component 3) ---
     persistence_pairs = compute_tda_persistence(prec_2d_np_clean)
+    thresholds_broadcast_1d = physical_thresholds[np.newaxis, :]
+
+    # --- 1. TDA Calculation for Betti 0 (Connected Components, Feature Index 2) ---
     pairs_d0 = np.array(
         [p[1] for p in persistence_pairs if p[0] == 0], dtype=np.float64
     )
 
     if pairs_d0.shape[0] > 0:
-        births = -pairs_d0[:, 0]
-        deaths = -pairs_d0[:, 1]
-        is_finite = deaths != -np.inf
-        is_background = ~is_finite
-        deaths[is_background] = np.inf
-        persistence = births - deaths
-        persistence[is_background] = np.inf
+        births_0 = -pairs_d0[:, 0]
+        deaths_0 = -pairs_d0[:, 1]
+        is_finite_0 = deaths_0 != -np.inf
+        is_background_0 = ~is_finite_0
+        deaths_0[is_background_0] = np.inf
+        persistence_0 = births_0 - deaths_0
+        persistence_0[is_background_0] = np.inf
 
-        is_significant = persistence > persistence_threshold
-        pers_thresh_mask = is_significant[:, np.newaxis]
-        births_broadcast = births[:, np.newaxis]
-        deaths_broadcast = deaths[:, np.newaxis]
-        thresholds_broadcast_1d = physical_thresholds[np.newaxis, :]
+        is_significant_0 = persistence_0 > persistence_threshold
+        pers_thresh_mask_0 = is_significant_0[:, np.newaxis]
 
-        birth_thresh_mask = births_broadcast >= thresholds_broadcast_1d
-        death_thresh_mask = deaths_broadcast < thresholds_broadcast_1d
+        birth_thresh_mask_0 = births_0[:, np.newaxis] >= thresholds_broadcast_1d
+        death_thresh_mask_0 = deaths_0[:, np.newaxis] < thresholds_broadcast_1d
 
-        finite_pass_mask = (
-            pers_thresh_mask
-            & birth_thresh_mask
-            & death_thresh_mask
-            & is_finite[:, np.newaxis]
+        finite_pass_mask_0 = (
+            pers_thresh_mask_0
+            & birth_thresh_mask_0
+            & death_thresh_mask_0
+            & is_finite_0[:, np.newaxis]
         )
-        finite_counts = np.sum(finite_pass_mask, axis=0)
 
-        # Count background component if threshold approaches zero
         background_low_thresh_mask = thresholds_broadcast_1d <= 0.01
-        background_pass_mask = (
-            pers_thresh_mask
-            & birth_thresh_mask
-            & is_background[:, np.newaxis]
+        background_pass_mask_0 = (
+            pers_thresh_mask_0
+            & birth_thresh_mask_0
+            & is_background_0[:, np.newaxis]
             & background_low_thresh_mask
         )
-        background_counts = np.sum(background_pass_mask, axis=0)
 
-        gamma_matrix[2, :] = finite_counts + background_counts
+        gamma_matrix[2, :] = np.sum(finite_pass_mask_0, axis=0) + np.sum(
+            background_pass_mask_0, axis=0
+        )
 
-    # --- 2. Area and Perimeter Computation ---
+    # --- 2. TDA Calculation for Betti 1 (Holes, Feature Index 3) ---
+    pairs_d1 = np.array(
+        [p[1] for p in persistence_pairs if p[0] == 1], dtype=np.float64
+    )
+
+    if pairs_d1.shape[0] > 0:
+        births_1 = -pairs_d1[:, 0]
+        deaths_1 = -pairs_d1[:, 1]
+        persistence_1 = births_1 - deaths_1
+
+        # Betti 1 components inherently have finite death values in strict 2D sub-level sets
+        is_significant_1 = persistence_1 > persistence_threshold
+        pers_thresh_mask_1 = is_significant_1[:, np.newaxis]
+
+        birth_thresh_mask_1 = births_1[:, np.newaxis] >= thresholds_broadcast_1d
+        death_thresh_mask_1 = deaths_1[:, np.newaxis] < thresholds_broadcast_1d
+
+        pass_mask_1 = pers_thresh_mask_1 & birth_thresh_mask_1 & death_thresh_mask_1
+        gamma_matrix[3, :] = np.sum(pass_mask_1, axis=0)
+
+    # --- 3. Area and Perimeter Computation ---
     pixel_area_km2 = pixel_size_km**2
     prec_broadcast = prec_2d_np_clean[..., np.newaxis]
     thresholds_broadcast_3d = physical_thresholds[np.newaxis, np.newaxis, :]
     masks_3d = prec_broadcast >= thresholds_broadcast_3d
 
-    # Area
-    area_counts = np.sum(masks_3d, axis=(0, 1))
-    gamma_matrix[0, :] = area_counts * pixel_area_km2
+    # Area (Feature Index 0)
+    gamma_matrix[0, :] = np.sum(masks_3d, axis=(0, 1)) * pixel_area_km2
 
-    # Perimeter
+    # Perimeter (Feature Index 1)
     import warnings
 
     with warnings.catch_warnings():
@@ -162,10 +176,9 @@ def worker_process_chunk(args):
     store = zarr.open(zarr_path, mode="r+")
     group = store[group_name]
 
-    # Read chunk into memory
     precip_chunk = group["original_precip"][start_idx:end_idx]
     gamma_chunk = np.zeros(
-        (precip_chunk.shape[0], 3, len(physical_thresholds)), dtype=np.float32
+        (precip_chunk.shape[0], 4, len(physical_thresholds)), dtype=np.float32
     )
 
     pixel_size_km = config.get("PIXEL_SIZE_KM", 2.0)
@@ -176,7 +189,6 @@ def worker_process_chunk(args):
             precip_chunk[i], physical_thresholds, pixel_size_km, pers_thresh
         )
 
-    # Write computed matrix back to Zarr
     group["gamma_targets"][start_idx:end_idx] = gamma_chunk
     return f"Processed indices {start_idx} to {end_idx} in {group_name}"
 
@@ -196,18 +208,16 @@ def main():
     )
     quantiles = np.array(config["QUANTILE_LEVELS"], dtype=np.float32)
 
-    # 1. Compute physical thresholds
     physical_thresholds = compute_climatological_thresholds(zarr_path, quantiles)
 
-    # Save physical thresholds for the loss function/emulator reference
     thresh_path = os.path.join(
         config["PREPROCESSED_DATA_DIR"], "physical_thresholds.npy"
     )
     np.save(thresh_path, physical_thresholds)
 
-    # 2. Process all splits
     store = zarr.open(zarr_path, mode="r+")
     chunk_size = config.get("WORKER_CHUNK_SIZE", 500)
+    print(f"\nUsing worker chunk size: {chunk_size} samples per worker process.")
 
     for split in ["train", "validation", "test"]:
         if split not in store:
@@ -217,12 +227,11 @@ def main():
         group = store[split]
         num_samples = group["original_precip"].shape[0]
 
-        # Initialize Zarr array for Gamma targets
         if "gamma_targets" not in group:
             group.create_dataset(
                 "gamma_targets",
-                shape=(num_samples, 3, len(quantiles)),
-                chunks=(chunk_size, 3, len(quantiles)),
+                shape=(num_samples, 4, len(quantiles)),  # Updated shape configuration
+                chunks=(chunk_size, 4, len(quantiles)),  # Updated chunks configuration
                 dtype="float32",
             )
 
@@ -239,7 +248,7 @@ def main():
             for future in tqdm(
                 as_completed(futures), total=len(tasks), desc=f"Writing {split}"
             ):
-                future.result()  # Catch any exceptions raised in workers
+                future.result()
 
     print("\nGamma targets successfully appended to Zarr store.")
 

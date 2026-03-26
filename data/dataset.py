@@ -103,6 +103,8 @@ class ZarrMixupDataset(Dataset):
         # Gamma targets are log-transformed for the loss function evaluation
         log_target_gamma = torch.log1p(target_phys_tensor)
 
+        # TODO: remove one of the input tensors in the return statement to avoid redundancy, as both are the same physical patch data. For now, we return both for compatibility with existing training loops.
+
         return input_tensor, log_target_gamma, input_tensor, target_phys_tensor
 
 
@@ -120,8 +122,9 @@ class DeterministicSRDataset(Dataset):
         dem_stats,
         scaler_max_val,
         split="train",
-        subset_fraction=1.0,
+        data_percentage=100.0,
         wet_dry_ratio=1.0,
+        load_in_ram=False,
     ):
         self.preprocessed_data_dir = preprocessed_data_dir
         self.dem_patches_dir = dem_patches_dir
@@ -129,12 +132,11 @@ class DeterministicSRDataset(Dataset):
         self.scaler_max_val = scaler_max_val
         self.split = split
         self.is_train = split == "train"
+        self.load_in_ram = load_in_ram
 
         self.zarr_path = os.path.join(
             self.preprocessed_data_dir, "preprocessed_dataset.zarr"
         )
-        self.store = None
-        self.group = None
 
         print(f"Loading and profiling {split} metadata...")
 
@@ -155,18 +157,21 @@ class DeterministicSRDataset(Dataset):
         is_wet_array = np.array(is_wet_list)
 
         # 2. Apply optional subsetting first
-        if 0.0 < subset_fraction < 1.0:
+        if 0.0 < data_percentage < 100.0:
             total_samples = len(self.valid_indices)
-            subset_size = max(int(total_samples * subset_fraction), 1)
+            subset_size = max(int(total_samples * data_percentage / 100.0), 1)
             rng = np.random.default_rng(seed=42)
             self.valid_indices = rng.choice(
                 self.valid_indices, size=subset_size, replace=False
             )
             # Filter the wet/dry boolean array to match the subset
             is_wet_array = is_wet_array[self.valid_indices]
-        elif subset_fraction <= 0.0 or subset_fraction > 1.0:
+            print(
+                f"Subsetting {split} dataset to {data_percentage:.1f}%. Subset size: {len(self.valid_indices)} samples."
+            )
+        elif data_percentage <= 0.0 or data_percentage > 100.0:
             raise ValueError(
-                f"subset_fraction must be in (0, 1]. Received {subset_fraction}"
+                f"data_percentage must be in (0, 100]. Received {data_percentage}"
             )
 
         # 3. Compute sample weights for stratified sampling
@@ -182,7 +187,23 @@ class DeterministicSRDataset(Dataset):
             self.sample_weights = np.where(is_wet_array, weight_wet, weight_dry)
             print(f"Dataset weighted: {n_wet} wet, {n_dry} dry instances available.")
 
-        # 4. Geometrical transforms
+        # 4. Handle Data Loading (RAM vs Disk)
+        if self.load_in_ram:
+            print(
+                f"Loading {split} dataset entirely into RAM (this may take a moment)..."
+            )
+            store = zarr.open(self.zarr_path, mode="r")
+            group = store[self.split]
+            # [:] pulls the entire Zarr array into a NumPy array in memory
+            self.original_precip_ram = group["original_precip"][:]
+            self.interpolated_precip_ram = group["interpolated_precip"][:]
+            self.gamma_targets_ram = group["gamma_targets"][:]
+            self.dem_ram = group["dem"][:]
+        else:
+            self.store = None
+            self.group = None
+
+        # 5. Geometrical transforms
         self.geom_transform = v2.Compose(
             [
                 v2.RandomHorizontalFlip(p=0.5),
@@ -199,12 +220,20 @@ class DeterministicSRDataset(Dataset):
         return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        self._init_zarr()
         real_idx = self.valid_indices[idx]
 
-        target_phys = self.group["original_precip"][real_idx]
-        interp_phys = self.group["interpolated_precip"][real_idx]
-        gamma_phys = self.group["gamma_targets"][real_idx]
+        # Read from RAM or Disk depending on initialization
+        if self.load_in_ram:
+            target_phys = self.original_precip_ram[real_idx]
+            interp_phys = self.interpolated_precip_ram[real_idx]
+            gamma_phys = self.gamma_targets_ram[real_idx]
+            dem_patch = self.dem_ram[real_idx]
+        else:
+            self._init_zarr()
+            target_phys = self.group["original_precip"][real_idx]
+            interp_phys = self.group["interpolated_precip"][real_idx]
+            gamma_phys = self.group["gamma_targets"][real_idx]
+            dem_patch = self.group["dem"][real_idx]
 
         target_log = np.log1p(target_phys)
         interp_log = np.log1p(interp_phys)
@@ -214,7 +243,6 @@ class DeterministicSRDataset(Dataset):
         target_tensor = torch.from_numpy(target_norm).float().unsqueeze(0)
         interp_tensor = torch.from_numpy(interp_norm).float().unsqueeze(0)
 
-        dem_patch = self.group["dem"][real_idx]
         dem_patch = (dem_patch - self.dem_mean) / (self.dem_std + 1e-8)
         dem_tensor = torch.from_numpy(dem_patch).float().unsqueeze(0)
 
@@ -242,7 +270,8 @@ class DiffusionSRDataset(Dataset):
         dem_stats,
         scaler_max_val,
         split="train",
-        subset_fraction=1.0,
+        data_percentage=100.0,
+        load_in_ram=False,
     ):
         self.preprocessed_data_dir = preprocessed_data_dir
         self.dem_patches_dir = dem_patches_dir
@@ -250,12 +279,11 @@ class DiffusionSRDataset(Dataset):
         self.scaler_max_val = scaler_max_val
         self.split = split
         self.is_train = split == "train"
+        self.load_in_ram = load_in_ram
 
         self.zarr_path = os.path.join(
             self.preprocessed_data_dir, "preprocessed_dataset.zarr"
         )
-        self.store = None
-        self.group = None
 
         print(f"Loading {split} metadata...")
 
@@ -271,29 +299,47 @@ class DiffusionSRDataset(Dataset):
         self.valid_indices = np.arange(len(self.metadata))
 
         # 2. Apply optional subsetting
-        if 0.0 < subset_fraction < 1.0:
+        if 0.0 < data_percentage < 100.0:
             total_samples = len(self.valid_indices)
-            subset_size = max(int(total_samples * subset_fraction), 1)
-            print(f"Subsetting {split} dataset to {subset_fraction*100:.1f}%.")
+            subset_size = max(int(total_samples * data_percentage / 100.0), 1)
+            print(f"Subsetting {split} dataset to {data_percentage:.1f}%.")
             rng = np.random.default_rng(seed=42)
             self.valid_indices = rng.choice(
                 self.valid_indices, size=subset_size, replace=False
             )
-        elif subset_fraction <= 0.0 or subset_fraction > 1.0:
+            print(f"Subset size: {len(self.valid_indices)} samples.")
+        elif data_percentage <= 0.0 or data_percentage > 100.0:
             raise ValueError(
-                f"subset_fraction must be in (0, 1]. Received {subset_fraction}"
+                f"data_percentage must be in (0, 100]. Received {data_percentage}"
             )
 
-        # 3. Handle legacy gamma targets
+        # 3. Handle legacy gamma targets fallback
         gamma_path = os.path.join(
             self.preprocessed_data_dir, split, "gamma_targets_persistence.npz"
         )
         if not os.path.exists(gamma_path):
-            self.gamma_targets = np.zeros((len(self.metadata), 3), dtype=np.float32)
+            self.legacy_gamma_targets = np.zeros(
+                (len(self.metadata), 3), dtype=np.float32
+            )
         else:
-            self.gamma_targets = np.load(gamma_path, mmap_mode="r")["data"]
+            self.legacy_gamma_targets = np.load(gamma_path, mmap_mode="r")["data"]
 
-        # 4. Geometrical transforms
+        # 4. Handle Data Loading (RAM vs Disk)
+        if self.load_in_ram:
+            print(
+                f"Loading {split} dataset entirely into RAM (this may take a moment)..."
+            )
+            store = zarr.open(self.zarr_path, mode="r")
+            group = store[self.split]
+            self.original_precip_ram = group["original_precip"][:]
+            self.interpolated_precip_ram = group["interpolated_precip"][:]
+            self.gamma_targets_ram = group["gamma_targets"][:]
+            self.dem_ram = group["dem"][:]
+        else:
+            self.store = None
+            self.group = None
+
+        # 5. Geometrical transforms
         self.geom_transform = v2.Compose(
             [
                 v2.RandomHorizontalFlip(p=0.5),
@@ -310,12 +356,20 @@ class DiffusionSRDataset(Dataset):
         return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        self._init_zarr()
         real_idx = self.valid_indices[idx]
 
-        target_phys = self.group["original_precip"][real_idx]
-        interp_phys = self.group["interpolated_precip"][real_idx]
-        gamma_phys = self.group["gamma_targets"][real_idx]
+        # Read from RAM or Disk depending on initialization
+        if self.load_in_ram:
+            target_phys = self.original_precip_ram[real_idx]
+            interp_phys = self.interpolated_precip_ram[real_idx]
+            gamma_phys = self.gamma_targets_ram[real_idx]
+            dem_patch = self.dem_ram[real_idx]
+        else:
+            self._init_zarr()
+            target_phys = self.group["original_precip"][real_idx]
+            interp_phys = self.group["interpolated_precip"][real_idx]
+            gamma_phys = self.group["gamma_targets"][real_idx]
+            dem_patch = self.group["dem"][real_idx]
 
         target_log = np.log1p(target_phys)
         interp_log = np.log1p(interp_phys)
@@ -327,7 +381,6 @@ class DiffusionSRDataset(Dataset):
         target_tensor = torch.from_numpy(target_norm).float().unsqueeze(0) * 2.0 - 1.0
         interp_tensor = torch.from_numpy(interp_norm).float().unsqueeze(0) * 2.0 - 1.0
 
-        dem_patch = self.group["dem"][real_idx]
         dem_patch = (dem_patch - self.dem_mean) / (self.dem_std + 1e-8)
         dem_tensor = torch.from_numpy(dem_patch).float().unsqueeze(0)
 

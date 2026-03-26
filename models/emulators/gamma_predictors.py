@@ -8,6 +8,23 @@ import math
 # ==========================================
 
 
+# class ScaledSpectralConv2d(nn.Module):
+#     """
+#     Applies spectral normalization and scales the output to target Lipschitz constant L.
+#     """
+#     def __init__(self, in_channels, out_channels, kernel_size, lipschitz_c=1.0, **kwargs):
+#         super().__init__()
+#         self.lipschitz_c = lipschitz_c
+#         # Apply standard spectral normalization (bounds L to 1)
+#         self.conv = nn.utils.spectral_norm(
+#             nn.Conv2d(in_channels, out_channels, kernel_size, **kwargs)
+#         )
+
+#     def forward(self, x):
+#         # Scale output to achieve the desired Lipschitz constant
+#         return self.lipschitz_c * self.conv(x)
+
+
 class RobustBlock(nn.Module):
     """
     Standard ResBlock with GroupNorm.
@@ -28,7 +45,7 @@ class RobustBlock(nn.Module):
         out = self.conv1(out)
         out = F.gelu(self.gn2(out))
         out = self.conv2(out)
-        return residual + out
+        return (residual + out) / 2.0  # Normalize to maintain Lipschitz constant
 
 
 # ==========================================
@@ -74,9 +91,10 @@ class BaselineCNN(nn.Module):
 
         pred_A = F.relu(self.head_A(feat))
         pred_P = F.relu(self.head_P(feat))
-        pred_CC = F.relu(self.head_CC(feat))
+        pred_B0 = F.relu(self.head_CC(feat))
+        pred_B1 = F.relu(self.head_CC(feat))
 
-        return torch.stack([pred_A, pred_P, pred_CC], dim=1)
+        return torch.stack([pred_A, pred_P, pred_B0, pred_B1], dim=1)
 
 
 # ==========================================
@@ -134,14 +152,15 @@ class LipschitzCNN(nn.Module):
         x = self.pool4(x)
         x = self.res4(self.res5(x))
 
-        feat = x.sum(dim=(2, 3))
+        feat = x.mean(dim=(2, 3))
         latent = F.gelu(self.fc(feat))
 
         pred_A = F.softplus(self.head_A(latent))
         pred_P = F.softplus(self.head_P(latent))
-        pred_CC = F.softplus(self.head_CC(latent))
+        pred_B0 = F.softplus(self.head_CC(latent))
+        pred_B1 = F.softplus(self.head_CC(latent))
 
-        return torch.stack([pred_A, pred_P, pred_CC], dim=1)
+        return torch.stack([pred_A, pred_P, pred_B0, pred_B1], dim=1)
 
 
 # ==========================================
@@ -224,7 +243,7 @@ class ConstrainedLipschitzCNN(nn.Module):
         x = self.pool4(x)
         x = self.res4(self.res5(x))
 
-        feat = x.sum(dim=(2, 3))
+        feat = x.mean(dim=(2, 3))
         latent = F.gelu(self.fc(feat))
 
         # --- Head 1: Area ---
@@ -242,7 +261,8 @@ class ConstrainedLipschitzCNN(nn.Module):
         R = 1.0 + F.softplus(self.head_P_roughness(latent))
         pred_P = P_min * R
 
-        # --- Head 3: CC ---
-        pred_CC = F.softplus(self.head_CC(latent))
+        # --- Head 3-4: CC ---
+        pred_B0 = F.softplus(self.head_CC(latent))
+        pred_B1 = F.softplus(self.head_CC(latent))
 
-        return torch.stack([pred_A, pred_P, pred_CC], dim=1)
+        return torch.stack([pred_A, pred_P, pred_B0, pred_B1], dim=1)

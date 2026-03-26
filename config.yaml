@@ -15,13 +15,14 @@ VAL_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/val_patches_metadata
 TEST_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/test_patches_metadata.txt"
 
 # --- PHYSICAL PREPROCESSING ---
+WORKER_CHUNK_SIZE: 250 
 PRECIP_VAR_NAME: "TOT_PREC"
 PATCH_SIZE: 128
-DOWNSCALING_FACTOR: 12.5  # RCM to OPERA high resolution (25km / 2km)
+DOWNSCALING_FACTOR: 12.5  # ERA5-like to OPERA km-scale (25km / 2km)
 PIXEL_SIZE_KM: 2.0
 DRIZZLE_THRESHOLD: 0.1
 DECLUTTER_THRESHOLD: 150.0
-PERSISTENCE_THRESHOLD: 1.0  # TDA topological noise floor
+PERSISTENCE_THRESHOLD: 1.0  # TDA topological noise floor 
 SPLIT_RATIOS:
   train: 0.8
   validation: 0.1
@@ -30,8 +31,8 @@ SPLIT_RATIOS:
 # --- DDPM TRAINING & HARDWARE ---
 EXPERIMENT_NAME: "DDPM_SR_Minkowski"
 DEVICE: "cuda"
-NUM_WORKERS: 4
-MAX_WORKERS: 4
+NUM_WORKERS: 10
+MAX_WORKERS: 10
 BATCH_SIZE: 128
 NUM_EPOCHS: 25
 PATIENCE: 5
@@ -43,7 +44,9 @@ WET_DRY_RATIO: 1.0  # 1.0 = 1:1 ratio. Ensures the DDPM learns convective struct
 
 # --- 4. TOPOLOGICAL TARGETS & EMULATOR ---
 # Climatological probability quantiles for Minkowski targets
-QUANTILE_LEVELS: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
+# QUANTILE_LEVELS: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
+QUANTILE_LEVELS: [0.01, 0.05, 0.1 , 0.15, 0.2 , 0.25, 0.3 , 0.35, 0.4 , 0.45, 0.5 ,
+       0.55, 0.6 , 0.65, 0.7 , 0.75, 0.8 , 0.85, 0.9 , 0.95, 0.99]
 
 # Path to the frozen emulator predicting the topological targets
 EMULATOR_CHECKPOINT_PATH: "/home/fquareng/work/ch2/final_experiment_runs/GammaEmulator_v6_Constrained_T1_2026-03-13_08-22-37/best_model_checkpoint.pth" 
@@ -54,10 +57,7 @@ ARCHITECTURE: "Constrained"  # 'Baseline', 'Lipschitz', 'Constrained'
 
 # --- MINKOWSKI CURRICULUM (EXPERIMENT TOGGLES) ---
 
-# For Experiment 1 (Vanilla DDPM): 
-# Set MINKOWSKI_TARGET_WEIGHT to 0.0 to completely disable the geometric loss.
-# For Experiment 2 (Minkowski DDPM): 
-# Set MINKOWSKI_TARGET_WEIGHT to 1.0 or your desired penalty lambda.
+# Set by arguments, default to 0.0 for ablation
 MINKOWSKI_TARGET_WEIGHT: 0.0
 
 # The Curriculum (Ramps up the weight over N epochs after physical convergence)

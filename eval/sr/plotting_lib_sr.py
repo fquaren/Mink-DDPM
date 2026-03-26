@@ -1,17 +1,16 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import argparse
 import os
 import warnings
 from tqdm import tqdm
-import pandas as pd
-
 
 # Import shared libraries
-import io_lib_sr as io_lib
-import metrics as metrics_lib
-import plotting_lib_sr as plotting_lib
+import eval.sr.io_lib_sr as io_lib
+import eval.sr.metrics_lib_sr as metrics_lib
+import eval.sr.plotting_lib_sr as plotting_lib
 
 # Import DDPM specific modules
 from models.SR.ddpm.ddpm import ContextUnet
@@ -25,6 +24,36 @@ from data.preprocessing.compute_gamma_targets import compute_gamma_matrix
 warnings.filterwarnings("ignore", message="No contour found", category=UserWarning)
 
 
+class DataDenormalizer:
+    def __init__(self, stats_path):
+        try:
+            data = np.load(stats_path)
+            self.max_val = float(data.item())
+            print(f"Loaded Denormalizer. Max Val (Log Space): {self.max_val:.4f}")
+        except FileNotFoundError:
+            print(
+                f"Warning: Scaling stats not found at {stats_path}. Defaulting to 1.0."
+            )
+            self.max_val = 1.0
+
+    def unnormalize(self, x_norm):
+        if isinstance(x_norm, torch.Tensor):
+            x_norm = x_norm.cpu().numpy()
+        x_scaled = x_norm * self.max_val
+        x_phys = np.expm1(x_scaled)
+        return np.maximum(x_phys, 0.0)
+
+    def unnormalize_torch(self, x_norm):
+        max_val_tensor = torch.tensor(
+            self.max_val, device=x_norm.device, dtype=x_norm.dtype
+        )
+        x_scaled = x_norm * max_val_tensor
+        # CRITICAL: Clamp the exponent to avoid Inf in float32
+        x_scaled = torch.clamp(x_scaled, max=50.0)
+        x_phys = torch.expm1(x_scaled)
+        return F.relu(x_phys)
+
+
 def load_ddpm_model(config, device, run_dir):
     checkpoint_path = os.path.join(run_dir, "ddpm_latest.pth")
     if not os.path.exists(checkpoint_path):
@@ -36,7 +65,6 @@ def load_ddpm_model(config, device, run_dir):
     model = ContextUnet(in_channels=1, c_in_condition=2, device=device).to(device)
 
     state_dict = torch.load(checkpoint_path, map_location=device)
-    # Handle both direct state_dicts and checkpoint dictionaries
     if "model_state_dict" in state_dict:
         model.load_state_dict(state_dict["model_state_dict"])
     else:
@@ -44,10 +72,8 @@ def load_ddpm_model(config, device, run_dir):
 
     model.eval()
 
+    # Align instantiation parameters exactly with training script
     diffusion = Diffusion(
-        noise_steps=1000,
-        beta_start=1e-4,
-        beta_end=0.02,
         img_size=config.get("PATCH_SIZE", 128),
         device=device,
     )
@@ -67,7 +93,7 @@ def run_ddpm_crps_audit(
     diffusion,
     loader,
     device,
-    denormalizer_max_val,
+    denormalizer,
     drizzle_threshold,
     n_ensemble=16,
     n_batches=10,
@@ -82,33 +108,30 @@ def run_ddpm_crps_audit(
 
             X, Y_true = X.to(device), Y_true.to(device)
 
-            # --- CRITICAL OOM FIX ---
-            # Subset the batch to prevent 2000+ image generations at once
             max_batch_allowed = 128 // n_ensemble
             B_sub = min(X.shape[0], max(1, max_batch_allowed))
             X_sub = X[:B_sub]
             Y_true_sub = Y_true[:B_sub]
 
-            # Repeat conditions K times -> Shape: [B_sub*K, C, H, W]
             X_repeated = X_sub.repeat_interleave(n_ensemble, dim=0)
 
-            # Fast DDIM Sampling
-            samples_norm = diffusion.sample_ddim(
-                model, n=B_sub * n_ensemble, conditions=X_repeated, ddim_steps=50
-            )
+            with torch.amp.autocast("cuda"):
+                samples_norm = diffusion.sample_ddim(
+                    model, n=B_sub * n_ensemble, conditions=X_repeated, ddim_steps=50
+                )
 
-            # --- DOMAIN INVERSION [-1, 1] -> [0, 1] ---
-            samples_norm = (samples_norm.clamp(-1.0, 1.0) + 1.0) / 2.0
-            Y_true_norm = (Y_true_sub + 1.0) / 2.0
+            # DOMAIN INVERSION [-1, 1] -> [0, 1]
+            samples_shifted = (samples_norm.clamp(-1.0, 1.0) + 1.0) / 2.0
+            Y_true_shifted = (Y_true_sub + 1.0) / 2.0
 
             # Denormalize to Physical mm/h
-            samples_phys = torch.expm1(samples_norm * denormalizer_max_val)
+            samples_phys = denormalizer.unnormalize_torch(samples_shifted)
             samples_phys = samples_phys * (samples_phys > drizzle_threshold).float()
             samples_ensemble = samples_phys.view(
                 B_sub, n_ensemble, Y_true.shape[2], Y_true.shape[3]
             )
 
-            Y_phys = torch.expm1(Y_true_norm * denormalizer_max_val)
+            Y_phys = denormalizer.unnormalize_torch(Y_true_shifted)
             Y_phys = Y_phys * (Y_phys > drizzle_threshold).float()
 
             batch_crps = compute_crps_ensemble(samples_ensemble, Y_phys)
@@ -128,7 +151,7 @@ def run_ddpm_prediction_loop(
     device,
     quantile_levels,
     pixel_size_km,
-    denormalizer_max_val,
+    denormalizer,
     pers_thresh,
     drizzle_threshold=0.1,
 ):
@@ -160,32 +183,28 @@ def run_ddpm_prediction_loop(
                 Y_gamma_log_target.to(device),
             )
 
-            # 1. DDIM Sampling [-1, 1]
-            pred_X_norm = diffusion.sample_ddim(
-                model, n=X.shape[0], conditions=X, ddim_steps=50
-            )
+            with torch.amp.autocast("cuda"):
+                pred_X_norm = diffusion.sample_ddim(
+                    model, n=X.shape[0], conditions=X, ddim_steps=50
+                )
 
-            # 2. DENORMALIZE [-1, 1] -> [0, 1] -> Physical mm/h
+            # DENORMALIZE [-1, 1] -> [0, 1] -> Physical mm/h
             pred_X_shifted = (pred_X_norm.clamp(-1.0, 1.0) + 1.0) / 2.0
             Y_true_shifted = (Y_true_norm + 1.0) / 2.0
-
             X_shifted = (X[:, 0:1, :, :] + 1.0) / 2.0
 
-            pred_X_phys = torch.expm1(pred_X_shifted * denormalizer_max_val)
-            Y_true_phys = torch.expm1(Y_true_shifted * denormalizer_max_val)
-
-            X_phys = torch.expm1(X_shifted * denormalizer_max_val)
+            pred_X_phys = denormalizer.unnormalize_torch(pred_X_shifted)
+            Y_true_phys = denormalizer.unnormalize_torch(Y_true_shifted)
+            X_phys = denormalizer.unnormalize_torch(X_shifted)
 
             pred_X_phys = pred_X_phys * (pred_X_phys > drizzle_threshold).float()
             Y_true_phys = Y_true_phys * (Y_true_phys > drizzle_threshold).float()
 
-            # Prepare Numpy Arrays [B, H, W]
             pred_X_np = pred_X_phys.squeeze(1).cpu().numpy()
             Y_true_np = Y_true_phys.squeeze(1).cpu().numpy()
 
-            # --- Compute Spatial Verification Metrics ---
-            eval_threshold = 1.0  # mm/h
-            eval_window = 5  # 5x5 pixel neighborhood
+            eval_threshold = 1.0
+            eval_window = 5
 
             fss_batch = metrics_lib.compute_batch_fss(
                 pred_X_np, Y_true_np, eval_window, eval_threshold
@@ -199,11 +218,9 @@ def run_ddpm_prediction_loop(
             all_sal_A.append(A_batch)
             all_sal_L.append(L_batch)
 
-            # 3. Analytic Gamma Calculation
-            pred_X_np = pred_X_phys.cpu().numpy()
             batch_gammas = [
                 compute_gamma_matrix(
-                    pred_X_np[i, 0], quantile_levels, pixel_size_km, pers_thresh
+                    pred_X_np[i], quantile_levels, pixel_size_km, pers_thresh
                 )
                 for i in range(pred_X_np.shape[0])
             ]
@@ -211,7 +228,6 @@ def run_ddpm_prediction_loop(
             all_preds_gamma_analytic.append(np.array(batch_gammas))
             all_targets_gamma_analytic.append(Y_gamma_log_target.cpu().numpy())
 
-            # 4. Pixel Losses
             loss_mae_sample = mae_criterion(pred_X_phys, Y_true_phys).mean(
                 dim=(1, 2, 3)
             )
@@ -220,7 +236,6 @@ def run_ddpm_prediction_loop(
             )
             loss_surr_sample = torch.zeros_like(loss_mae_sample)
 
-            # 5. Emulator Consistency Audit (If in Minkowski Mode)
             if emulator and audit_criterion:
                 gamma_pred_phys = emulator(pred_X_phys)
                 gamma_true_phys = emulator(Y_true_phys)
@@ -228,7 +243,6 @@ def run_ddpm_prediction_loop(
                 gamma_pred_log = torch.log1p(gamma_pred_phys)
                 gamma_true_log = torch.log1p(gamma_true_phys)
 
-                # Compute Distances using MinkowskiLoss
                 l1 = audit_criterion(gamma_pred_log, Y_gamma_log_target)
                 l2 = audit_criterion(gamma_pred_log, gamma_true_log)
                 l3 = audit_criterion(gamma_true_log, Y_gamma_log_target)
@@ -245,7 +259,6 @@ def run_ddpm_prediction_loop(
                 for k in audit_results:
                     audit_results[k].append(nan_vec)
 
-            # 6. Collect Spatial Results
             all_preds_phys.append(pred_X_phys.squeeze(1).cpu().numpy())
             all_targets_phys.append(Y_true_phys.squeeze(1).cpu().numpy())
             all_inputs_phys.append(X_phys.squeeze(1).cpu().numpy())
@@ -254,7 +267,6 @@ def run_ddpm_prediction_loop(
             all_mse_losses.append(loss_mse_sample.cpu().numpy())
             all_surrogate_losses.append(loss_surr_sample.cpu().numpy())
 
-    # Concatenate all lists
     return (
         np.concatenate(all_preds_gamma_analytic, axis=0),
         np.concatenate(all_targets_gamma_analytic, axis=0),
@@ -278,20 +290,16 @@ def main(run_dir):
     scaler_path = os.path.join(
         config["PREPROCESSED_DATA_DIR"], "log_precip_max_val.npy"
     )
-    if os.path.exists(scaler_path):
-        PHYSICAL_MAX_VAL = float(np.load(scaler_path).item())
-    else:
-        PHYSICAL_MAX_VAL = 1.0
+    denormalizer = DataDenormalizer(scaler_path)
 
     model, diffusion = load_ddpm_model(config, device, run_dir)
     dem_stats = io_lib.load_dem_stats(config)
-    test_loader = io_lib.load_data(config, dem_stats, PHYSICAL_MAX_VAL)
+    test_loader = io_lib.load_data(config, dem_stats, denormalizer.max_val)
 
     QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
     PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
     EMULATOR_PATH = config.get("EMULATOR_CHECKPOINT_PATH", None)
 
-    # Vanilla vs. Minkowski Mode detection
     emulator = None
     audit_criterion = None
     if EMULATOR_PATH and os.path.exists(EMULATOR_PATH):
@@ -301,7 +309,6 @@ def main(run_dir):
     else:
         print("Running in VANILLA MODE (No Emulator Audit).")
 
-    # Run Prediction Loop
     (
         all_preds_gamma,
         all_targets_gamma,
@@ -325,7 +332,7 @@ def main(run_dir):
         device,
         QUANTILE_LEVELS,
         PIXEL_SIZE_KM,
-        PHYSICAL_MAX_VAL,
+        denormalizer,
         config.get("PERSISTENCE_THRESHOLD", 0.05),
         config.get("DRIZZLE_THRESHOLD", 0.1),
     )
@@ -355,12 +362,11 @@ def main(run_dir):
     metrics_df["Consistency_Flag"] = audit_results["consistency_gap"]
 
     group_metrics = metrics_lib.calculate_grouped_metrics(metrics_df)
-    group_metrics_series = pd.Series(group_metrics)
     per_feature_gamma_metrics = metrics_lib.calculate_per_feature_gamma_metrics(
         metrics_df, QUANTILE_LEVELS
     )
 
-    io_lib.save_metrics_text(run_dir, group_metrics_series, per_feature_gamma_metrics)
+    io_lib.save_metrics_text(run_dir, group_metrics, per_feature_gamma_metrics)
     io_lib.save_metrics_npz(run_dir, metrics_df, per_feature_gamma_metrics)
 
     if emulator:
@@ -372,7 +378,7 @@ def main(run_dir):
         diffusion,
         test_loader,
         device,
-        PHYSICAL_MAX_VAL,
+        denormalizer,
         config.get("DRIZZLE_THRESHOLD", 0.1),
     )
 
