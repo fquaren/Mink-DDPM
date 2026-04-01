@@ -29,7 +29,7 @@ SPLIT_RATIOS:
   test: 0.1
 
 # --- DDPM TRAINING & HARDWARE ---
-EXPERIMENT_NAME: "DDPM_SR_Minkowski"
+EXPERIMENT_NAME: "DDPM_SR_SpecLoss"
 DEVICE: "cuda"
 NUM_WORKERS: 10
 MAX_WORKERS: 10
@@ -49,7 +49,7 @@ QUANTILE_LEVELS: [0.01, 0.05, 0.1 , 0.15, 0.2 , 0.25, 0.3 , 0.35, 0.4 , 0.45, 0.
        0.55, 0.6 , 0.65, 0.7 , 0.75, 0.8 , 0.85, 0.9 , 0.95, 0.99]
 
 # Path to the frozen emulator predicting the topological targets
-EMULATOR_CHECKPOINT_PATH: "/home/fquareng/work/ch2/final_experiment_runs/GammaEmulator_v6_Constrained_T1_2026-03-13_08-22-37/best_model_checkpoint.pth" 
+EMULATOR_CHECKPOINT_PATH: "/home/fquareng/work/ch2/final_experiment_runs/GammaEmulator_v6_Constrained_T1_2026-03-13_08-22-37/best_model_checkpoint.pth"
 #"/home/fquareng/work/final_experiment_runs/GammaEmulator_v6_Constrained_SingleRun_2026-01-23_14-44-58/best_model_checkpoint.pth"
 
 # Required for load_emulator() instantiation
@@ -66,6 +66,33 @@ MINKOWSKI_WARMUP_EPOCHS: 5
 # The Time Gate (Do not compute Minkowski loss if diffusion timestep t >= threshold)
 MINKOWSKI_T_THRESHOLD: 250
 
-# The Trust Gate (Exponential decay based on emulator confidence). 
+# The Trust Gate (Exponential decay based on emulator confidence).
 # Run `calibrate_tau_log_space()` to find the exact aggressive/stable value.
 TRUST_TAU: 0.1
+
+# --- Auxiliary loss curriculum for train_ddpm_spec.py ---
+AUX_LOSS_TYPE: "fft2d"  # fft2d | ssim | optical_flow | wet_area
+AUX_TARGET_WEIGHT: 0.0
+AUX_WARMUP_EPOCHS: 5
+AUX_T_THRESHOLD: 250
+
+# FFT2D loss
+FFT2D_ALPHA: 0.95
+
+# SSIM loss
+SSIM_WINDOW_SIZE: 11
+
+# Optical-flow loss
+OPTICAL_FLOW_PATCH_SIZE: 21
+OPTICAL_FLOW_SEARCH_RADIUS: 6
+OPTICAL_FLOW_DOWNSAMPLE: 4
+OPTICAL_FLOW_PREPROCESS_SIGMA: 1.0
+OPTICAL_FLOW_DELTA: 0.2
+OPTICAL_FLOW_MASK_THRESHOLD: 0.05
+OPTICAL_FLOW_LOSS_TYPE: "huber"  # huber | l1
+
+# Wet-area loss
+WET_AREA_THRESHOLD: 0.1
+WET_AREA_TEMPERATURE: 0.1
+WET_AREA_FALSE_POSITIVE_WEIGHT: 1.0
+WET_AREA_FALSE_NEGATIVE_WEIGHT: 1.0

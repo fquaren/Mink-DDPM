@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mink-ddpm-gan-fftd2"
+version = "0.1.0"
+description = "Minkowski DDPM with spectral CRPS and frozen GAN discriminator feature loss"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "torch>=2.1",
+  "torchvision>=0.16",
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "einops>=0.7",
+  "tqdm>=4.65",
+  "pyyaml>=6.0",
+  "pillow>=10.0",
+  "rich>=13.0",
+]
+
+[dependency-groups]
+tf-conversion = [
+  "tensorflow>=2.13",
+  "tensorflow-addons>=0.21",
+]
+dev = [
+  "pytest>=7.4",
+  "ruff>=0.3",
+  "black>=24.0",
+  "ipython",
+  "xarray",
+  "requests",
+  "ee"
+]
+geo = [
+  "rioxarray",
+  "rasterio>=1.4.3",
+]
+
+[tool.uv]
+required-environments = [
+  "sys_platform == 'darwin' and platform_machine == 'x86_64'"
+]
+
+[tool.uv.pip]
+only-binary = ["rasterio"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I"]
