@@ -25,7 +25,7 @@ export NUMBA_CACHE_DIR="${PROJECT_ROOT}/numba_cache_${TIMESTAMP}"
 mkdir -p $NUMBA_CACHE_DIR
 
 # Define pipeline scripts
-DEM_SCRIPT="${SCRIPT_DIR}/download_dem.sh"
+DEM_SCRIPT="${PROJECT_ROOT}/scripts/data/download_dem.sh"
 METADATA_SCRIPT="${SCRIPT_DIR}/generate_metadata.py"
 CONSOLIDATE_SCRIPT="${SCRIPT_DIR}/consolidate_and_split_shuf.py"
 PREPROCESS_SCRIPT="${SCRIPT_DIR}/preprocess_data.py"
@@ -44,30 +44,30 @@ source /home/fquareng/.bashrc
     echo "Configuration file: ${CONFIG_FILE}"
     echo "Job starting on $(hostname) at $(date)"
 
-    # echo ""
-    # echo "--- STAGE 0: Acquiring Static Boundary Conditions (DEM) ---"
-    # micromamba run -n dl-stable bash "${DEM_SCRIPT}" "${CONFIG_FILE}"
-    # echo "--- STAGE 0 COMPLETE ---"
+    echo ""
+    echo "--- STAGE 0: Acquiring Static Boundary Conditions (DEM) ---"
+    micromamba run -n dl-stable bash "${DEM_SCRIPT}" "${CONFIG_FILE}"
+    echo "--- STAGE 0 COMPLETE ---"
 
-    # echo ""
-    # echo "--- STAGE 1: Generating Patch Metadata and Timestamp Map ---"
-    # micromamba run -n dl-stable python "${METADATA_SCRIPT}" "${CONFIG_FILE}"
-    # echo "--- STAGE 1 COMPLETE ---"
+    echo ""
+    echo "--- STAGE 1: Generating Patch Metadata and Timestamp Map ---"
+    micromamba run -n dl-stable python "${METADATA_SCRIPT}" "${CONFIG_FILE}"
+    echo "--- STAGE 1 COMPLETE ---"
 
-    # echo ""
-    # echo "--- STAGE 2: Consolidating and Shuffling Metadata ---"
-    # micromamba run -n dl-stable python "${CONSOLIDATE_SCRIPT}" "${CONFIG_FILE}"
-    # echo "--- STAGE 2 COMPLETE ---"
+    echo ""
+    echo "--- STAGE 2: Consolidating and Shuffling Metadata ---"
+    micromamba run -n dl-stable python "${CONSOLIDATE_SCRIPT}" "${CONFIG_FILE}"
+    echo "--- STAGE 2 COMPLETE ---"
 
-    # echo ""
-    # echo "--- STAGE 3: Preprocessing Data into Final Zarr Store ---"
-    # micromamba run -n dl-stable python "${PREPROCESS_SCRIPT}" "${CONFIG_FILE}"
-    # echo "--- STAGE 3 COMPLETE ---"
+    echo ""
+    echo "--- STAGE 3: Preprocessing Data into Final Zarr Store ---"
+    micromamba run -n dl-stable python "${PREPROCESS_SCRIPT}" "${CONFIG_FILE}"
+    echo "--- STAGE 3 COMPLETE ---"
 
-    # echo ""
-    # echo "--- STAGE 4: Computing Empirical Persistence Thresholds ---"
-    # micromamba run -n dl-stable python "${THRESHOLDS_SCRIPT}" "${CONFIG_FILE}"
-    # echo "--- STAGE 4 COMPLETE ---"
+    echo ""
+    echo "--- STAGE 4: Computing Empirical Persistence Thresholds ---"
+    micromamba run -n dl-stable python "${THRESHOLDS_SCRIPT}" "${CONFIG_FILE}"
+    echo "--- STAGE 4 COMPLETE ---"
 
     echo ""
     echo "--- STAGE 5: Extracting Topological Gamma Targets ---"
@@ -78,10 +78,6 @@ source /home/fquareng/.bashrc
     echo "--- STAGE 6: Applying Mixup Augmentation ---"
     micromamba run -n dl-stable python "${MIXUP_SCRIPT}" "${CONFIG_FILE}"
     echo "--- STAGE 6 COMPLETE ---"
-
-    echo ""
-    echo "Cleaning up local Numba cache directory..."
-    rm -rf $NUMBA_CACHE_DIR
 
     echo "--- PIPELINE FINISHED SUCCESSFULLY at $(date) ---"
 } > "$LOG_FILE" 2>&1

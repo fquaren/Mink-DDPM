@@ -13,6 +13,7 @@ LOG_FILE="${LOG_DIR}/calibrate_tau_run_${TIMESTAMP}.log"
 # --- HARDWARE SETTINGS ---
 # Explicitly set the GPU (Good practice even with 1 GPU)
 export CUDA_VISIBLE_DEVICES=0
+export LD_LIBRARY_PATH=/work/fquareng/.micromamba/envs/dl-stable/lib:$LD_LIBRARY_PATH
 
 # Force Python to flush stdout/stderr immediately so you can tail the log in real-time
 export PYTHONUNBUFFERED=1
@@ -23,6 +24,6 @@ echo "Logs will be saved to: $LOG_FILE"
 
 # We redirect both stdout (1) and stderr (2) to the log file
 source /home/fquareng/.bashrc
-micromamba run -n dl python "$SCRIPT_PATH" > "$LOG_FILE" 2>&1
+micromamba run -n dl-stable python "$SCRIPT_PATH" > "$LOG_FILE" 2>&1
 
 echo "Training finished."

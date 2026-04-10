@@ -51,8 +51,9 @@ class Diffusion(nn.Module):
         return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * epsilon, epsilon
 
     def sample_timesteps(self, n):
-        """Samples n random timesteps for training."""
-        return torch.randint(low=1, high=self.noise_steps, size=(n,)).to(self.device)
+        # low=0 includes the final denoising step.
+        # high=self.noise_steps handles the exclusive upper bound mathematically.
+        return torch.randint(low=0, high=self.noise_steps, size=(n,)).to(self.device)
 
     def sample(self, model, n, conditions):
         """

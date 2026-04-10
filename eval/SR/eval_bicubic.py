@@ -19,9 +19,7 @@ parent_path = os.path.dirname(
 if parent_path not in sys.path:
     sys.path.insert(0, parent_path)
 
-from models.SR.ddpm.ddpm import ContextUnet
-from models.SR.ddpm.diffusion import Diffusion
-from data.dataset import DiffusionSRDataset
+from data.dataset import DeterministicSRDataset
 from src.loss import AnalyticalMinkowskiLoss
 
 # --- Metric Implementations ---
@@ -131,9 +129,7 @@ def compute_raps_error(pred, target):
 # --- Main Evaluation Loop ---
 
 
-def evaluate(args):
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+def evaluate_bicubic(args):
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
@@ -153,16 +149,15 @@ def evaluate(args):
     max_val = float(np.load(max_val_path).item())
     denormalizer = DataDenormalizer(max_val)
 
-    test_dataset = DiffusionSRDataset(
+    test_dataset = DeterministicSRDataset(
         config["PREPROCESSED_DATA_DIR"],
         config.get("TEST_METADATA_FILE", config["VAL_METADATA_FILE"]),
         config["DEM_DATA_DIR"],
         dem_stats,
         scaler_max_val=max_val,
         split="test",
-        data_percentage=100.0,
+        load_in_ram=False,
     )
-
     test_loader = DataLoader(
         test_dataset,
         batch_size=config["BATCH_SIZE"],
@@ -170,12 +165,6 @@ def evaluate(args):
         num_workers=config["NUM_WORKERS"],
     )
 
-    model = ContextUnet(in_channels=1, c_in_condition=2, device=device).to(device)
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint)
-    model.eval()
-
-    diffusion = Diffusion(img_size=128, device=device)
     criterion_mae = nn.L1Loss()
     criterion_minkowski = AnalyticalMinkowskiLoss(
         thresholds=config["QUANTILE_LEVELS"]
@@ -192,39 +181,26 @@ def evaluate(args):
         "sal_A": {t: [] for t in sal_thresholds},
         "sal_L": {t: [] for t in sal_thresholds},
         "raps_mae": [],
-        "fss": {
-            (1.0, 3): [],
-            (1.0, 9): [],
-            (1.0, 27): [],
-            (5.0, 3): [],
-            (5.0, 9): [],
-            (5.0, 27): [],
-            (10.0, 3): [],
-            (10.0, 9): [],
-            (10.0, 27): [],
-        },
+        "fss": {(t, w): [] for t in [1.0, 5.0, 10.0] for w in [3, 9, 27]},
     }
 
-    print(
-        f"Starting deterministic DDIM evaluation on {len(test_dataset)} samples using device: {device}"
-    )
+    print(f"Starting Bicubic Baseline evaluation on {len(test_dataset)} samples")
 
     with torch.no_grad():
-        for X, Y_norm, Y_gamma_log, *_ in tqdm(test_loader, desc="Evaluating DDPM"):
+        for X, Y_norm, Y_gamma_log in tqdm(test_loader, desc="Interpolating"):
             X, Y_norm, Y_gamma_log = (
                 X.to(device),
                 Y_norm.to(device),
                 Y_gamma_log.to(device),
             )
-            Y_pred_norm = diffusion.sample_ddim(
-                model, n=X.shape[0], conditions=X, ddim_steps=args.ddim_steps
+
+            target_size = (Y_norm.size(2), Y_norm.size(3))
+            Y_pred_norm = F.interpolate(
+                X[:, 0:1, :, :], size=target_size, mode="bicubic", align_corners=False
             )
 
-            Y_pred_shifted = (Y_pred_norm[:, 0:1].clamp(-1.0, 1.0) + 1.0) / 2.0
-            Y_target_shifted = (Y_norm[:, 0:1] + 1.0) / 2.0
-
-            pred_phys = denormalizer.unnormalize_torch(Y_pred_shifted)
-            target_phys = denormalizer.unnormalize_torch(Y_target_shifted)
+            pred_phys = denormalizer.unnormalize_torch(Y_pred_norm)
+            target_phys = denormalizer.unnormalize_torch(Y_norm[:, 0:1])
 
             metrics["mae_phys"].append(criterion_mae(pred_phys, target_phys).item())
             metrics["minkowski"].append(
@@ -279,26 +255,7 @@ def evaluate(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Evaluate SR DDPM model using deterministic DDIM."
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to the model checkpoint (.pth)",
-    )
-    parser.add_argument(
-        "--save_json",
-        type=str,
-        default="eval_results_ddpm.json",
-        help="Path to save output metrics",
-    )
-    parser.add_argument(
-        "--ddim_steps", type=int, default=50, help="Number of steps for DDIM sampling"
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42, help="Global seed for initial noise generation"
-    )
+    parser = argparse.ArgumentParser(description="Evaluate Bicubic Baseline.")
+    parser.add_argument("--save_json", type=str, default="bicubic_results.json")
     args = parser.parse_args()
-    evaluate(args)
+    evaluate_bicubic(args)

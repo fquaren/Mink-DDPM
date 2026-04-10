@@ -4,7 +4,6 @@ import yaml
 import torch
 import torch.nn.functional as F
 import numpy as np
-from scipy.stats import norm
 from sklearn.decomposition import IncrementalPCA
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error, r2_score
@@ -12,49 +11,93 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # --- Path Setup ---
-parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+parent_path = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+print(f"Adding {parent_path} to sys.path for module imports.")
 if parent_path not in sys.path:
     sys.path.insert(0, parent_path)
 
 from data.dataset import ZarrMixupDataset
-from eval.sr.metrics_lib_sr import compute_isoperimetric_violation
+from eval.SR.metrics_lib_sr import compute_isoperimetric_violation
 
 
 def compute_analytical_approximation(
-    field_phys, thresholds, init_factor=0.1, min_temp=1e-3
+    field_phys,
+    thresholds,
+    pixel_size_km=2.0,
+    init_factor=1e-5,
+    min_temp=1e-6,
+    persistence_thresh=1.8699999839067458,
 ):
-    """
-    Computes the differentiable analytical approximation of Minkowski functionals.
-    field_phys: Tensor [B, 1, H, W] in physical space.
-    thresholds: Array or Tensor of physical thresholds.
-    """
     device = field_phys.device
     thresholds_tensor = torch.tensor(thresholds, dtype=torch.float32, device=device)
+    base_temps_tensor = torch.tensor(
+        np.maximum(np.array(thresholds) * init_factor, min_temp),
+        dtype=torch.float32,
+        device=device,
+    )
 
-    base_temps = np.maximum(np.array(thresholds) * init_factor, min_temp)
-    base_temps_tensor = torch.tensor(base_temps, dtype=torch.float32, device=device)
-
+    pixel_area = pixel_size_km**2
     areas, perimeters, eulers = [], [], []
+
+    # --- TOPOLOGY PRE-PROCESSING ---
+    # 1. Morphological Closing (Fills small false holes / Betti-1)
+    dilated = F.max_pool2d(field_phys, kernel_size=3, stride=1, padding=1)
+    closed = -F.max_pool2d(-dilated, kernel_size=3, stride=1, padding=1)
+
+    # 2. Morphological Opening (Removes small false spikes)
+    eroded = -F.max_pool2d(-closed, kernel_size=3, stride=1, padding=1)
+    field_phys_topo = F.max_pool2d(eroded, kernel_size=3, stride=1, padding=1)
+
+    # 3. Local Maximum for Persistence
+    local_max = F.max_pool2d(field_phys_topo, kernel_size=15, stride=1, padding=7)
 
     for q_idx, thresh in enumerate(thresholds_tensor):
         current_temp = base_temps_tensor[q_idx]
 
-        p = torch.sigmoid((field_phys - thresh) / current_temp)
+        # --- PATH 1: EXACT GEOMETRY (Area & Perimeter) ---
+        p_raw = torch.sigmoid((field_phys - thresh) / current_temp)
 
-        area = torch.sum(p, dim=(1, 2, 3))
+        area = torch.sum(p_raw, dim=(1, 2, 3)) * pixel_area
 
-        dx = p[:, :, :, 1:] - p[:, :, :, :-1]
-        dy = p[:, :, 1:, :] - p[:, :, :-1, :]
-        perimeter = torch.sum(
-            torch.sqrt(dx[:, :, :-1, :] ** 2 + dy[:, :, :, :-1] ** 2 + 1e-8),
-            dim=(1, 2, 3),
+        p_pad = F.pad(p_raw, (0, 1, 0, 1), mode="replicate")
+        # Symmetric central differences (x[i+1] - x[i-1]) / 2
+        dx = (p_pad[:, :, 1:-1, 2:] - p_pad[:, :, 1:-1, :-2]) / 2.0
+        dy = (p_pad[:, :, 2:, 1:-1] - p_pad[:, :, :-2, 1:-1]) / 2.0
+
+        perimeter = (
+            torch.sum(
+                torch.sqrt(dx**2 + dy**2 + 1e-8),
+                dim=(2, 3),
+            )
+            * pixel_size_km
         )
 
-        V = torch.sum(p, dim=(1, 2, 3))
-        E_x = torch.sum(p[:, :, :, :-1] * p[:, :, :, 1:], dim=(1, 2, 3))
-        E_y = torch.sum(p[:, :, :-1, :] * p[:, :, 1:, :], dim=(1, 2, 3))
+        # --- PATH 2: AMPLITUDE-AWARE TOPOLOGY (Euler) ---
+        p_base = torch.sigmoid((field_phys_topo - thresh) / current_temp)
+
+        # Binary mask: 1 if neighborhood peak > thresh + persistence, else 0
+        persistence_mask = torch.sigmoid(
+            (local_max - (thresh + persistence_thresh)) / current_temp
+        )
+
+        # Apply mask using Gödel T-norm (min) to prevent fractional distortion
+        p_topo = torch.min(p_base, persistence_mask)
+
+        # Gödel T-norm Expected Euler Characteristic
+        V = torch.sum(p_topo, dim=(1, 2, 3))
+        E_x = torch.sum(
+            torch.min(p_topo[:, :, :, :-1], p_topo[:, :, :, 1:]), dim=(1, 2, 3)
+        )
+        E_y = torch.sum(
+            torch.min(p_topo[:, :, :-1, :], p_topo[:, :, 1:, :]), dim=(1, 2, 3)
+        )
         F_faces = torch.sum(
-            p[:, :, :-1, :-1] * p[:, :, :-1, 1:] * p[:, :, 1:, :-1] * p[:, :, 1:, 1:],
+            torch.min(
+                torch.min(p_topo[:, :, :-1, :-1], p_topo[:, :, :-1, 1:]),
+                torch.min(p_topo[:, :, 1:, :-1], p_topo[:, :, 1:, 1:]),
+            ),
             dim=(1, 2, 3),
         )
         euler = V - E_x - E_y + F_faces
@@ -72,44 +115,7 @@ def compute_analytical_approximation(
         dim=1,
     )
 
-    pred_gamma_log = torch.sign(pred_gamma_phys) * torch.log1p(
-        torch.abs(pred_gamma_phys)
-    )
-    return pred_gamma_log
-
-
-def compute_gkf_expectations(dataset, physical_thresholds, scaler_val):
-    """
-    Computes GKF analytical expectations.
-    """
-    loader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4)
-
-    sum_val, sum_sq, count = 0.0, 0.0, 0
-    grad_var_sum, grad_count = 0.0, 0
-
-    for inputs, _, _, _ in tqdm(loader, desc="Computing GKF expectations"):
-        field = inputs.squeeze(1).numpy()
-
-        sum_val += field.sum()
-        sum_sq += (field**2).sum()
-        count += field.size
-
-        dy, dx = np.gradient(field, axis=(1, 2))
-        grad_var_sum += (dy**2 + dx**2).sum() / 2.0
-        grad_count += dy.size
-
-    mu = sum_val / count
-    sigma = np.sqrt((sum_sq / count) - mu**2)
-    lambda_2 = (grad_var_sum / grad_count) / (sigma**2)
-
-    log_thresh = np.log1p(physical_thresholds) / scaler_val
-    u = (log_thresh - mu) / sigma
-
-    e_area = 1.0 - norm.cdf(u)
-    e_perimeter = (np.sqrt(lambda_2) / 4.0) * np.exp(-(u**2) / 2.0)
-    e_euler = (lambda_2 / ((2 * np.pi) ** (1.5))) * u * np.exp(-(u**2) / 2.0)
-
-    return np.vstack([e_area, e_perimeter, e_euler])
+    return torch.sign(pred_gamma_phys) * torch.log1p(torch.abs(pred_gamma_phys))
 
 
 def train_pcr_baseline(train_dataset, n_components=50):
@@ -120,7 +126,7 @@ def train_pcr_baseline(train_dataset, n_components=50):
 
     ipca = IncrementalPCA(n_components=n_components)
     print("Fitting Incremental PCA...")
-    for inputs, _, _, _ in loader:
+    for inputs, _, _, _ in tqdm(loader, desc="Fitting Incremental PCA"):
         X_batch = inputs.view(inputs.size(0), -1).numpy()
         ipca.partial_fit(X_batch)
 
@@ -128,7 +134,7 @@ def train_pcr_baseline(train_dataset, n_components=50):
     y_list = []
 
     print("Transforming data and accumulating targets...")
-    for inputs, log_target_gamma, _, _ in loader:
+    for inputs, log_target_gamma, _, _ in tqdm(loader, desc="Transforming Data"):
         X_batch = inputs.view(inputs.size(0), -1).numpy()
         X_pca_list.append(ipca.transform(X_batch))
 
@@ -175,14 +181,15 @@ def evaluate_predictions(y_true_log, y_pred_log, quantiles, feature_names):
 
 def evaluate_baselines(zarr_path, thresholds_path, scaler_val, n_components, quantiles):
     print("--- Initializing datasets ---")
-    train_dataset = ZarrMixupDataset(
-        zarr_path,
-        split="train",
-        scaler_val=scaler_val,
-        include_original=True,
-        include_mixup=False,
-        augment=False,
-    )
+    # train_dataset = ZarrMixupDataset(
+    #     zarr_path,
+    #     split="train",
+    #     scaler_val=scaler_val,
+    #     include_original=True,
+    #     include_mixup=False,
+    #     augment=False,
+    #     subset_fraction=0.01,
+    # )
     test_dataset = ZarrMixupDataset(
         zarr_path,
         split="test",
@@ -190,13 +197,14 @@ def evaluate_baselines(zarr_path, thresholds_path, scaler_val, n_components, qua
         include_original=True,
         include_mixup=False,
         augment=False,
+        subset_fraction=0.01,
     )
 
     physical_thresholds = np.load(thresholds_path)
 
-    # 1. PCR Baseline Execution (4 Channels)
-    print("\n--- Running principal component regression (PCR) baseline ---")
-    ipca, ridge = train_pcr_baseline(train_dataset, n_components=n_components)
+    # # 1. PCR Baseline Execution (4 Channels)
+    # print("\n--- Running principal component regression (PCR) baseline ---")
+    # ipca, ridge = train_pcr_baseline(train_dataset, n_components=n_components)
 
     # 2. Test Set Inference and Target Construction
     print("\n--- Accumulating test targets and predictions ---")
@@ -206,7 +214,7 @@ def evaluate_baselines(zarr_path, thresholds_path, scaler_val, n_components, qua
     x_test_list = []
     y_pred_analytical_list = []
 
-    for inputs, log_target_gamma, _, _ in test_loader:
+    for inputs, log_target_gamma, _, _ in tqdm(test_loader):
         y_true_4ch_list.append(log_target_gamma.numpy())
         x_test_list.append(inputs.view(inputs.size(0), -1).numpy())
 
@@ -220,7 +228,7 @@ def evaluate_baselines(zarr_path, thresholds_path, scaler_val, n_components, qua
             y_pred_analytical_list.append(gamma_analytical.numpy())
 
     y_true_log_4ch = np.concatenate(y_true_4ch_list, axis=0)
-    x_test_flat = np.concatenate(x_test_list, axis=0)
+    # x_test_flat = np.concatenate(x_test_list, axis=0)
     y_pred_analytical = np.concatenate(y_pred_analytical_list, axis=0)
 
     # Compute true Euler characteristic in physical space and re-transform
@@ -232,20 +240,20 @@ def evaluate_baselines(zarr_path, thresholds_path, scaler_val, n_components, qua
         [y_true_log_4ch[:, 0, :], y_true_log_4ch[:, 1, :], true_euler_log], axis=1
     )
 
-    # Transform PCA and predict
-    x_pca = ipca.transform(x_test_flat)
-    y_pred_pcr_flat = ridge.predict(x_pca)
-    y_pred_pcr = y_pred_pcr_flat.reshape(y_true_log_4ch.shape)
+    # # Transform PCA and predict
+    # x_pca = ipca.transform(x_test_flat)
+    # y_pred_pcr_flat = ridge.predict(x_pca)
+    # y_pred_pcr = y_pred_pcr_flat.reshape(y_true_log_4ch.shape)
 
-    # 4. Final Evaluation Printout
-    print("\n=============================================")
-    print("  Linear Statistical Baseline (PCR) Metrics  ")
-    print("=============================================")
-    pcr_metrics = evaluate_predictions(
-        y_true_log_4ch, y_pred_pcr, quantiles, ["Area", "Perimeter", "Betti0", "Betti1"]
-    )
-    for k, v in pcr_metrics.items():
-        print(f"{k}: {v:.4f}")
+    # # 4. Final Evaluation Printout
+    # print("\n=============================================")
+    # print("  Linear Statistical Baseline (PCR) Metrics  ")
+    # print("=============================================")
+    # pcr_metrics = evaluate_predictions(
+    #     y_true_log_4ch, y_pred_pcr, quantiles, ["Area", "Perimeter", "Betti0", "Betti1"]
+    # )
+    # for k, v in pcr_metrics.items():
+    #     print(f"{k}: {v:.4f}")
 
     print("\n=============================================")
     print("      Analytical Approximation Metrics       ")
@@ -258,7 +266,7 @@ def evaluate_baselines(zarr_path, thresholds_path, scaler_val, n_components, qua
 
     # Dump results to a YAML file for later analysis
     results = {
-        "PCR": pcr_metrics,
+        # "PCR": pcr_metrics,
         "Analytical_Approximation": ana_metrics,
     }
     with open(os.path.join(parent_path, "baseline_evaluation_results.yaml"), "w") as f:

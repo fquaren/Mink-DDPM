@@ -6,19 +6,19 @@
 # ==============================================================================
 
 PROJECT_ROOT="/home/fquareng/work/ch2/Mink-DDPM"
-EVAL_EMU_SCRIPT="${PROJECT_ROOT}/src/eval.py"
-EVAL_BASE_SCRIPT="${PROJECT_ROOT}/src/evaluate_baselines.py"
-RUNS_DIR="${PROJECT_ROOT}/final_experiment_runs"
+EVAL_EMU_SCRIPT="${PROJECT_ROOT}/eval/gamma/eval_emu.py"
+RUNS_DIR="/home/fquareng/work/ch2/ci26_revision_runs"
 CONFIG_PATH="${PROJECT_ROOT}/config.yaml"
 LOG_DIR="${PROJECT_ROOT}/logs/Eval_$(date +%Y%m%d_%H%M%S)"
 ENV_NAME="dl-stable"
+export LD_LIBRARY_PATH=/work/fquareng/.micromamba/envs/dl-stable/lib:$LD_LIBRARY_PATH
 
 mkdir -p "$LOG_DIR"
 
-eval "$(micromamba shell hook --shell bash)"
+source ~/.bashrc
 micromamba activate "$ENV_NAME"
 
-ARCHS=("Baseline" "Lipschitz" "Constrained")
+ARCHS=("Constrained" "Lipschitz" "Baseline") 
 
 echo "======================================================================"
 echo "STARTING PARALLEL EVALUATION"
@@ -32,7 +32,9 @@ for arch in "${ARCHS[@]}"; do
     for run_dir in "${RUNS_DIR}/GammaEmulator_${arch}"*; do
         if [ -d "$run_dir" ]; then
             run_name=$(basename "$run_dir")
+            echo "Found run: $run_name"
             log_file="${LOG_DIR}/eval_${run_name}.log"
+            echo "Logging to: $log_file"
             
             echo "  -> Dispatching: $run_name"
             python "$EVAL_EMU_SCRIPT" \
@@ -45,11 +47,6 @@ for arch in "${ARCHS[@]}"; do
     echo "Waiting for ${arch} evaluations to complete..."
     wait
 done
-
-# 2. Evaluate Baselines
-echo "--- Evaluating Baselines (PCR & Analytical) ---"
-log_file="${LOG_DIR}/eval_baselines.log"
-python "$EVAL_BASE_SCRIPT" "$CONFIG_PATH" > "$log_file" 2>&1
 
 echo "======================================================================"
 echo "EVALUATION PIPELINE COMPLETE"

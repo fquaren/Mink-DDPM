@@ -2,17 +2,16 @@
 
 # --- CONFIGURATION ---
 PROJECT_ROOT="/home/fquareng/work/ch2/Mink-DDPM" 
-SCRIPT_PATH="${PROJECT_ROOT}/eval/SR/eval_ddpm.py"
+SCRIPT_PATH="${PROJECT_ROOT}/eval/SR/eval_unet.py"
 
 # Specify the exact run directory here
-TARGET_RUN_DIR="/home/fquareng/work/ch2/ci26_revision_runs/sr_experiment_runs/DDPM_SR_Minkowski_20260402_094108/ddpm_best.pth"
-
+TARGET_RUN_DIR="/home/fquareng/work/ch2/ci26_revision_runs/sr_experiment_runs/UNet_SR_Minkowski_20260403_184335/unet_best.pth"
 
 # Logging setup
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="${PROJECT_ROOT}/logs"
 mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/ddpm_eval_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/unet_eval_${TIMESTAMP}.log"
 
 # --- HARDWARE SETTINGS ---
 export CUDA_VISIBLE_DEVICES=0

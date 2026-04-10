@@ -8,7 +8,9 @@ import sys
 from torch.utils.data import DataLoader
 
 # --- Path Setup ---
-parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+parent_path = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 if parent_path not in sys.path:
     sys.path.insert(0, parent_path)
 
@@ -82,11 +84,11 @@ def generate_saliency_samples(model, loader, device, n_examples=10):
 
 def compute_jacobian_stats(model, loader, device, n_samples=100):
     """
-    Computes Gradient Norms.
+    Computes Gradient Norms for the 3 geometric outputs.
     """
     print(f"\nComputing Jacobian Spectrum on subset ({n_samples} samples)...")
     model.eval()
-    norms = {"Area": [], "Perimeter": [], "B0": [], "B1": []}
+    norms = {"Area": [], "Perimeter": [], "B0": []}
     count = 0
 
     for input_data, _, _, _ in loader:
@@ -98,7 +100,6 @@ def compute_jacobian_stats(model, loader, device, n_samples=100):
 
         output = model(input_data)
 
-        # [HANDLE FNO TUPLE]
         if isinstance(output, tuple):
             output = output[0]  # Use Mean for gradient stability check
 
@@ -123,6 +124,7 @@ def compute_jacobian_stats(model, loader, device, n_samples=100):
 
         # 3. B0 Gradient
         target_B0 = output[:, 2, mid_idx].sum()
+        # retain_graph=False is correct here as it is the final pass for B0
         grad_B0 = torch.autograd.grad(
             target_B0, input_data, retain_graph=False, create_graph=False
         )[0]
@@ -130,20 +132,6 @@ def compute_jacobian_stats(model, loader, device, n_samples=100):
             grad_B0.view(grad_B0.size(0), -1).norm(p=2, dim=1).detach().cpu().numpy()
         )
         norms["B0"].extend(norm_B0)
-
-        # 3. B1 Gradient
-        target_B1 = output[:, 2, mid_idx].sum()
-        grad_B1 = torch.autograd.grad(
-            target_B1, input_data, retain_graph=False, create_graph=False
-        )[0]
-        norm_B1 = (
-            grad_B1.view(grad_B1.size(0), -1).norm(p=2, dim=1).detach().cpu().numpy()
-        )
-        norms["B1"].extend(norm_B1)
-
-        model.zero_grad()
-        input_data.grad = None
-        count += input_data.size(0)
 
     return norms
 
@@ -159,7 +147,8 @@ def setup_evaluation(run_dir):
         config["PREPROCESSED_DATA_DIR"], "log_precip_max_val.npy"
     )
     if os.path.exists(scaler_path):
-        scaler_val = float(np.load(scaler_path))
+        # FIX 1: Extract scalar value correctly to avoid DeprecationWarning
+        scaler_val = float(np.load(scaler_path).item())
     else:
         scaler_val = 5.01
 
@@ -221,28 +210,38 @@ def run_prediction_loop(model, loader, criterion, device):
     model.eval()
     all_preds_phys, all_targets_phys = [], []
     all_original_images, all_total_losses = [], []
+    all_geom_losses = []  # FIX 2: Added list for geometric losses
 
     # Weights for the evaluation metric integration
-    w_a, w_p, w_b0, w_b1 = 1.0, 1.0, 1.0, 1.0
+    w_a, w_p, w_b0 = 1.0, 1.0, 1.0
 
     with torch.no_grad():
         for input_data, log_target_gamma, _, target_phys_tensor in tqdm(
             loader, desc="Inference"
         ):
             input_data = input_data.to(device)
-            log_target_gamma = log_target_gamma.to(device)
+            # Ensure target tensor aligns with the 3 outputs: A, P, B0
+            log_target_gamma = log_target_gamma[:, :3, :].to(device)
+
+            # Slice the physical targets as well, if they are used down the line
+            target_phys_tensor = target_phys_tensor[:, :3, :]
 
             predicted_gamma_phys = model(input_data)
             predicted_gamma_log = torch.log1p(predicted_gamma_phys)
 
-            weighted_total_loss, loss_a, loss_p, loss_b0, loss_b1 = criterion(
-                predicted_gamma_log, log_target_gamma, w_a, w_p, w_b0, w_b1
+            weighted_total_loss, loss_a, loss_p, loss_b0 = criterion(
+                predicted_gamma_log, log_target_gamma, w_a, w_p, w_b0
             )
 
             # Revert normalized input to physical scale for visualization
             input_phys = torch.expm1(input_data * loader.dataset.scaler_val)
 
             all_total_losses.append(weighted_total_loss.cpu().numpy())
+
+            # Stack the 3 individual components into a single tensor [Batch, 3] and store
+            geom_loss_batch = torch.stack([loss_a, loss_p, loss_b0], dim=1)
+            all_geom_losses.append(geom_loss_batch.cpu().numpy())
+
             all_preds_phys.append(predicted_gamma_phys.cpu().numpy())
             all_targets_phys.append(target_phys_tensor.numpy())
             all_original_images.append(input_phys.squeeze(1).cpu().numpy())
@@ -252,6 +251,7 @@ def run_prediction_loop(model, loader, criterion, device):
         np.concatenate(all_targets_phys, axis=0),
         np.concatenate(all_original_images, axis=0),
         np.concatenate(all_total_losses, axis=0),
+        np.concatenate(all_geom_losses, axis=0),  # Included in return
     )
 
 
@@ -263,27 +263,42 @@ def main(run_dir, architecture_type):
     QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
     criterion = MinkowskiLoss(quantile_levels=QUANTILE_LEVELS).to(device)
 
+    print("\nStarting Prediction Loop...")
     results = run_prediction_loop(model, test_loader, criterion, device)
-    all_preds_phys, all_targets_phys, all_original_images, all_total_losses = results
+    print("Prediction Loop Complete. Processing Results...")
 
-    # The metrics_df and subsequent library calls must be updated to expect 4 channels
-    # instead of 4 (A, P, B0, B1).
+    # FIX 3: Unpack the 5th variable
+    (
+        all_preds_phys,
+        all_targets_phys,
+        all_original_images,
+        all_total_losses,
+        all_geom_losses,
+    ) = results
+
+    print("Creating Metrics DataFrame...")
+    # Pass arrays natively; remove list() wrappers
     metrics_df = metrics_lib.create_metrics_dataframe(
-        all_preds_phys, all_targets_phys, all_original_images, all_total_losses
+        all_preds_phys,
+        all_targets_phys,
+        all_original_images,
+        all_total_losses,
+        all_geom_losses,
     )
 
+    print("Computing Jacobian Statistics...")
     jacobian_norms = compute_jacobian_stats(model, test_loader, device, n_samples=200)
-    # saliency_data = generate_saliency_samples(model, test_loader, device, n_examples=5)
+    saliency_data = generate_saliency_samples(model, test_loader, device, n_examples=5)
 
     group_metrics_sample_wise = metrics_lib.calculate_grouped_metrics(metrics_df)
     per_feature_metrics = metrics_lib.calculate_per_feature_metrics(
         all_preds_phys, all_targets_phys, QUANTILE_LEVELS
     )
 
+    print("Generating Plots...")
     # Plotting calls
     plotting_lib.plot_isoperimetric_check(all_preds_phys, run_dir)
-    # plotting_lib.plot_dry_input_error(all_preds_phys, all_original_images, run_dir)
-    # plotting_lib.plot_saliency_maps(saliency_data, run_dir)
+    plotting_lib.plot_saliency_maps(saliency_data, run_dir)
     plotting_lib.plot_jacobian_spectrum(
         jacobian_data=jacobian_norms, output_dir=run_dir
     )

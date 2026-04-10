@@ -19,8 +19,10 @@ eval "$(micromamba shell hook --shell bash)"
 source ~/.bashrc
 micromamba activate "$ENV_NAME"
 
-ARCHS=("Baseline" "Lipschitz" "Constrained") 
+ARCHS=("Constrained" "Baseline" "Lipschitz")
 SEEDS=(42)  # You can add more seeds for a more robust study, e.g., (42 123 2024)
+
+GPUS=(1 2 3)  # Assuming you have at least 3 GPUs. Adjust if you have fewer or more.
 
 # Counter for visual progress
 BATCH_NUM=1
@@ -39,23 +41,21 @@ for seed in "${SEEDS[@]}"; do
     echo "----------------------------------------------------------------------"
 
     # --- INNER LOOP: PARALLEL (Iterate through Architectures) ---
-    for arch in "${ARCHS[@]}"; do
+    for i in "${!ARCHS[@]}"; do
+        arch="${ARCHS[$i]}"
+        gpu_id=${GPUS[$((i % ${#GPUS[@]}))]}
         
-        # Log name must include seed to prevent overwriting
         LOG_FILE="${LOG_DIR}/${arch}_seed${seed}.log"
-        echo "Logging to: $LOG_FILE"
+        echo "   [Batch ${BATCH_NUM}] Launching: $arch on GPU $gpu_id (Seed $seed)"
+        echo "   Logs will be saved to: $LOG_FILE"
         
-        echo "   [Batch ${BATCH_NUM}] Launching: $arch (Seed $seed)"
-        
-        python "$TRAIN_SCRIPT_PATH" \
+        # Inline assignment guarantees the Python process inherits the variable
+        CUDA_VISIBLE_DEVICES=$gpu_id python "$TRAIN_SCRIPT_PATH" \
             --arch "$arch" \
-            --optimize \
-            --data_fraction .5 \
+            --load_params "${PROJECT_ROOT}/training_params/${arch}_emulator_hp.yaml" \
+            --data_fraction 0.1 \
             --seed "$seed" \
             > "$LOG_FILE" 2>&1 &
-            
-        # Optional: Save PID if you need to kill specific jobs later
-        # PIDS+=($!) 
     done
 
     echo "   >>> Waiting for all 3 architectures to finish for Seed ${seed}..."

@@ -27,9 +27,8 @@ echo "Logs will be saved to: $LOG_FILE"
 # We redirect both stdout (1) and stderr (2) to the log file
 source /home/fquareng/.bashrc
 micromamba run -n dl-stable python "$SCRIPT_PATH" \
-    --data_percentage 10.0 \
-    --weight_geom=1.0 \
-    --geom_start_epoch=5 \
+    --data_percentage 25.0 \
+    --weight_geom 0.001 \
     --params_path "/home/fquareng/work/ch2/Mink-DDPM/unet_mink_params.yaml" >> "$LOG_FILE" 2>&1
 
 echo "Training finished."

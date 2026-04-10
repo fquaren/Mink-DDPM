@@ -51,16 +51,9 @@ EMULATOR_PATH = config.get("EMULATOR_CHECKPOINT_PATH", "checkpoints/emulator_bes
 
 
 class DataDenormalizer:
-    def __init__(self, stats_path):
-        try:
-            data = np.load(stats_path)
-            self.max_val = float(data.item())
-            print(f"Loaded Denormalizer. Max Val (Log Space): {self.max_val:.4f}")
-        except FileNotFoundError:
-            print(
-                f"Warning: Scaling stats not found at {stats_path}. Defaulting to 1.0."
-            )
-            self.max_val = 1.0
+    def __init__(self, max_val):
+        self.max_val = float(max_val)
+        print(f"Loaded Denormalizer. Max Val (Log Space): {self.max_val:.4f}")
 
     def unnormalize(self, x_norm):
         if isinstance(x_norm, torch.Tensor):
@@ -160,8 +153,7 @@ def compute_geometric_loss_component(
                 Y_phys = Y_phys * (Y_phys > 0.1).float()
                 gamma_truth_phys = emulator(Y_phys)
                 gamma_truth_log_pred = torch.log1p(gamma_truth_phys)
-                # Ensure diff is calculated in f32
-                diff_trust = gamma_truth_log_pred - Y_gamma_log_f32
+                diff_trust = gamma_truth_log_pred - Y_gamma_log_f32[:, :3, :]
                 emu_error_sq = diff_trust.pow(2).mean(dim=(1, 2))
                 trust_weights = torch.exp(-float(TRUST_TAU) * emu_error_sq)
                 avg_trust_val = trust_weights.mean().item()
@@ -171,10 +163,8 @@ def compute_geometric_loss_component(
         pred_gamma_phys = emulator(pred_phys)
         pred_gamma_log = torch.log1p(pred_gamma_phys)
 
-        # MinkowskiLoss returns: total_dist [B], area [B], perimeter [B], betti0 [B], betti1 [B]
-        batch_total_dist, _, _, _, _ = criterion(pred_gamma_log, Y_gamma_log_f32)
+        batch_total_dist, _, _, _ = criterion(pred_gamma_log, Y_gamma_log_f32[:, :3, :])
 
-        # Apply trust weights and average over batch
         weighted_loss = batch_total_dist * trust_weights.view(-1)
         loss_geom = weighted_loss.mean()
 
@@ -183,48 +173,36 @@ def compute_geometric_loss_component(
 
 def save_sample_images(model, loader, device, out_dir, epoch, denormalizer):
     model.eval()
-    selected_X, selected_Y = [], []
-    dry_count, wet_count = 0, 0
-    target_dry, target_wet = 1, 4
-    drizzle_threshold = 0.1
 
-    for X_batch, Y_batch, _ in loader:
-        X_batch = X_batch.to(device, non_blocking=True)
-        Y_batch = Y_batch.to(device, non_blocking=True)
-        X_phys = denormalizer.unnormalize_torch(X_batch[:, 0])
-        max_precip = X_phys.amax(dim=(1, 2))
+    X_batch, Y_batch, _ = next(iter(loader))
+    X_batch = X_batch.to(device, non_blocking=True)
+    Y_batch = Y_batch.to(device, non_blocking=True)
 
-        for i in range(X_batch.size(0)):
-            if max_precip[i] <= drizzle_threshold and dry_count < target_dry:
-                selected_X.append(X_batch[i : i + 1])
-                selected_Y.append(Y_batch[i : i + 1])
-                dry_count += 1
-            elif max_precip[i] > drizzle_threshold and wet_count < target_wet:
-                selected_X.append(X_batch[i : i + 1])
-                selected_Y.append(Y_batch[i : i + 1])
-                wet_count += 1
-            if dry_count == target_dry and wet_count == target_wet:
-                break
-        if dry_count == target_dry and wet_count == target_wet:
-            break
+    X_phys = denormalizer.unnormalize_torch(X_batch[:, 0])
+    total_precip = X_phys.sum(dim=(1, 2))
 
-    if not selected_X:
-        return
-
-    X_sample = torch.cat(selected_X, dim=0)
-    Y_sample = torch.cat(selected_Y, dim=0)
-    n_samples = X_sample.size(0)
+    max_idx = total_precip.argmax().item()
+    X_sample = X_batch[max_idx : max_idx + 1]
+    Y_sample = Y_batch[max_idx : max_idx + 1]
 
     with torch.no_grad():
-        with torch.amp.autocast("cuda" if "cuda" in device else "cpu"):
+        with torch.amp.autocast("cuda" if "cuda" in str(device) else "cpu"):
             x_generated = model(X_sample)
 
     X_norm = X_sample[:, 0].float().cpu().numpy()
     Y_norm = Y_sample[:, 0].float().cpu().numpy()
     Gen_norm = x_generated[:, 0].float().cpu().clamp(0.0, 1.0).numpy()
-    X_phys = denormalizer.unnormalize(X_norm)
-    Y_phys = denormalizer.unnormalize(Y_norm)
-    Gen_phys = denormalizer.unnormalize(Gen_norm)
+
+    img_in = denormalizer.unnormalize(X_norm)[0]
+    img_target = denormalizer.unnormalize(Y_norm)[0]
+    img_gen = denormalizer.unnormalize(Gen_norm)[0]
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    data_path = os.path.join(out_dir, f"sample_data_epoch_{epoch:03d}.npz")
+    np.savez_compressed(
+        data_path, img_in=img_in, img_target=img_target, img_gen=img_gen
+    )
 
     precip_cmap = copy.copy(plt.get_cmap("Blues"))
     precip_cmap.set_bad(color="lightgrey", alpha=1.0)
@@ -234,33 +212,28 @@ def save_sample_images(model, loader, device, out_dir, epoch, denormalizer):
         masked[masked <= threshold] = np.nan
         return masked
 
-    _, axs = plt.subplots(n_samples, 3, figsize=(18, 5 * n_samples), squeeze=False)
-    for i in range(n_samples):
-        img_in, img_target, img_gen = X_phys[i], Y_phys[i], Gen_phys[i]
-        vmax = max(
-            np.nanmax([np.nanmax(img_in), np.nanmax(img_target), np.nanmax(img_gen)]),
-            1.0,
-        )
-        norm = mcolors.Normalize(vmin=0, vmax=vmax)
-        axs[i, 0].imshow(
-            mask_low_values(img_in), cmap=precip_cmap, norm=norm, origin="lower"
-        )
-        axs[i, 0].set_title(f"Input (LR) | Max: {np.nanmax(img_in):.2f}")
-        axs[i, 0].axis("off")
-        axs[i, 1].imshow(
-            mask_low_values(img_gen), cmap=precip_cmap, norm=norm, origin="lower"
-        )
-        axs[i, 1].set_title(f"Generated (SR) | Max: {np.nanmax(img_gen):.2f}")
-        axs[i, 1].axis("off")
-        im3 = axs[i, 2].imshow(
-            mask_low_values(img_target), cmap=precip_cmap, norm=norm, origin="lower"
-        )
-        axs[i, 2].set_title(f"Target (HR) | Max: {np.nanmax(img_target):.2f}")
-        axs[i, 2].axis("off")
-        plt.colorbar(im3, ax=axs[i, 2], fraction=0.046, pad=0.04)
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+    vmax = max(
+        np.nanmax([np.nanmax(img_in), np.nanmax(img_target), np.nanmax(img_gen)]), 1.0
+    )
+    norm = mcolors.Normalize(vmin=0, vmax=vmax)
 
+    axs[0].imshow(mask_low_values(img_in), cmap=precip_cmap, norm=norm, origin="lower")
+    axs[0].set_title(f"Input (LR) | Max: {np.nanmax(img_in):.2f}")
+    axs[0].axis("off")
+
+    axs[1].imshow(mask_low_values(img_gen), cmap=precip_cmap, norm=norm, origin="lower")
+    axs[1].set_title(f"Generated (SR) | Max: {np.nanmax(img_gen):.2f}")
+    axs[1].axis("off")
+
+    im3 = axs[2].imshow(
+        mask_low_values(img_target), cmap=precip_cmap, norm=norm, origin="lower"
+    )
+    axs[2].set_title(f"Target (HR) | Max: {np.nanmax(img_target):.2f}")
+    axs[2].axis("off")
+
+    plt.colorbar(im3, ax=axs[2], fraction=0.046, pad=0.04)
     plt.tight_layout()
-    os.makedirs(out_dir, exist_ok=True)
     plt.savefig(
         os.path.join(out_dir, f"sample_epoch_{epoch:03d}.png"),
         bbox_inches="tight",
@@ -280,7 +253,10 @@ def compute_physical_metrics(real_batch, gen_batch, drizzle_threshold=0.1):
     return {"wasserstein_dist": wd, "max_intensity_err": max_err}
 
 
-def run_training(args, trial=None):
+# ------------------------------------------------------------------------------
+# Modified Training Loop for Script 2 (Emulator Version)
+# ------------------------------------------------------------------------------
+def run_training(args, dem_stats, max_val, trial=None):
     if torch.cuda.is_available():
         device = "cuda"
         torch.set_float32_matmul_precision("high")
@@ -295,24 +271,18 @@ def run_training(args, trial=None):
     out_dir = os.path.join("sr_experiment_runs", run_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    with open(DEM_STATS, "r") as f:
-        stats_dict = json.load(f)
-    dem_stats = (float(stats_dict["dem_mean"]), float(stats_dict["dem_std"]))
-
     params_path = args.params_path
     with open(params_path, "r") as file:
         unet_params = yaml.safe_load(file)
 
-    denormalizer = DataDenormalizer(
-        os.path.join(PREPROCESSED_DATA_DIR, "log_precip_max_val.npy")
-    )
+    denormalizer = DataDenormalizer(max_val)
 
     train_dataset = DeterministicSRDataset(
         PREPROCESSED_DATA_DIR,
         METADATA_TRAIN,
         DEM_DATA_DIR,
         dem_stats,
-        scaler_max_val=denormalizer.max_val,
+        scaler_max_val=max_val,
         split="train",
         data_percentage=args.data_percentage,
         load_in_ram=False,
@@ -322,7 +292,7 @@ def run_training(args, trial=None):
         METADATA_VAL,
         DEM_DATA_DIR,
         dem_stats,
-        scaler_max_val=denormalizer.max_val,
+        scaler_max_val=max_val,
         split="validation",
         data_percentage=args.data_percentage,
         load_in_ram=False,
@@ -341,13 +311,14 @@ def run_training(args, trial=None):
         num_workers=NUM_WORKERS,
     )
     val_loader = DataLoader(
-        val_dataset,
+        dataset=val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=True,
     )
 
+    # Constant target weight acts as w_max
     GEOMETRIC_TARGET_WEIGHT = (
         args.weight_geom
         if args.weight_geom is not None
@@ -374,7 +345,10 @@ def run_training(args, trial=None):
         current_lr = unet_params["lr"]
         current_wd = unet_params["weight_decay"]
 
-    optimizer = optim.AdamW(model.parameters(), lr=current_lr, weight_decay=current_wd)
+    optimizer = optim.AdamW(
+        [{"params": model.parameters()}], lr=current_lr, weight_decay=current_wd
+    )
+
     mse = nn.MSELoss()
     scheduler_patience = max(1, PATIENCE // 2)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -386,19 +360,20 @@ def run_training(args, trial=None):
 
     history = {
         "epoch": [],
-        "train_loss": [],
-        "val_loss": [],
-        "train_geom": [],
-        "val_geom": [],
+        "train_loss_total": [],
+        "train_loss_mse": [],
+        "train_loss_geom": [],
+        "val_loss_total": [],
+        "val_loss_mse": [],
+        "val_loss_geom": [],
         "avg_trust": [],
         "geom_weight": [],
         "learning_rate": [],
     }
 
     start_epoch = 0
-    geometric_phase = False
-    geometric_start_epoch = None
     best_wd_metric = float("inf")
+    best_val_loss = float("inf")  # Add initialization here
 
     if args.resume and os.path.isfile(args.resume) and not trial:
         checkpoint = torch.load(args.resume, map_location=device)
@@ -409,51 +384,26 @@ def run_training(args, trial=None):
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         start_epoch = checkpoint["epoch"]
-        geometric_phase = checkpoint.get("geometric_phase", False)
-        geometric_start_epoch = checkpoint.get("geometric_start_epoch", None)
         early_stopper.load_state_dict(checkpoint["early_stop_state"])
         history = checkpoint.get("history", history)
 
     for epoch in range(start_epoch, EPOCHS):
         model.train()
-        if (
-            GEOMETRIC_TARGET_WEIGHT > 0.0
-            and args.geom_start_epoch != -1
-            and epoch == args.geom_start_epoch
-            and not geometric_phase
-        ):
-            if not trial:
-                print(
-                    f"!!! Reached epoch {args.geom_start_epoch}. Triggering geometric curriculum !!!"
-                )
-            geometric_phase = True
-            geometric_start_epoch = epoch
-            early_stopper.reset()
-            optimizer = optim.AdamW(
-                model.parameters(), lr=current_lr, weight_decay=current_wd
-            )
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode="min", factor=0.5, patience=scheduler_patience
-            )
-
-        current_geom_weight = 0.0
-        if geometric_phase and geometric_start_epoch is not None:
-            progress = min(
-                1.0,
-                max(
-                    0.0,
-                    (epoch - geometric_start_epoch) / float(GEOMETRIC_WARMUP_EPOCHS),
-                ),
-            )
-            current_geom_weight = GEOMETRIC_TARGET_WEIGHT * progress
-
         current_lr_value = optimizer.param_groups[0]["lr"]
+
+        # Calculate cosine annealing schedule
+        w_min = 0.0
+        current_geom_weight = w_min + 0.5 * (GEOMETRIC_TARGET_WEIGHT - w_min) * (
+            1 + np.cos(np.pi * epoch / EPOCHS)
+        )
+
         pbar = tqdm(
             train_loader,
-            desc=f"Epoch {epoch+1}/{EPOCHS} [W={current_geom_weight:.3f}]",
+            desc=f"Epoch {epoch+1}/{EPOCHS} [W_geom={current_geom_weight:.4f}]",
             mininterval=30.0,
         )
-        running_loss, running_geom, running_trust = 0.0, 0.0, 0.0
+
+        running_total, running_mse, running_geom, running_trust = 0.0, 0.0, 0.0, 0.0
 
         for X, Y, Y_gamma in pbar:
             X, Y, Y_gamma = (
@@ -462,6 +412,7 @@ def run_training(args, trial=None):
                 Y_gamma.to(device, non_blocking=True),
             )
             optimizer.zero_grad()
+
             with torch.amp.autocast(
                 "cuda" if device == "cuda" else "cpu", enabled=scaler_enabled
             ):
@@ -480,20 +431,30 @@ def run_training(args, trial=None):
                         Y_gamma,
                         compute_trust=True,
                     )
-                total_loss = loss_mse + (current_geom_weight * loss_geom)
+
+                total_loss = loss_mse + current_geom_weight * loss_geom
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            running_loss += loss_mse.item()
+            running_total += total_loss.item()
+            running_mse += loss_mse.item()
             running_geom += (
                 loss_geom.item() if isinstance(loss_geom, torch.Tensor) else loss_geom
             )
             running_trust += avg_trust_val
 
+            pbar.set_postfix(
+                Tot=f"{total_loss.item():.3f}",
+                MSE=f"{loss_mse.item():.4f}",
+                Geom=f"{loss_geom.item() if isinstance(loss_geom, torch.Tensor) else loss_geom:.4f}",
+                Trust=f"{avg_trust_val:.3f}",
+            )
+
         model.eval()
-        val_mse_loss, val_geom_loss = 0.0, 0.0
+        val_total_loss, val_mse_loss, val_geom_loss, val_trust_acc = 0.0, 0.0, 0.0, 0.0
+
         with torch.no_grad():
             for X, Y, Y_gamma in val_loader:
                 X, Y, Y_gamma = X.to(device), Y.to(device), Y_gamma.to(device)
@@ -503,9 +464,10 @@ def run_training(args, trial=None):
                     Y_pred = model(X)
                     loss_m = mse(Y_pred, Y)
                     loss_g = torch.tensor(0.0, device=device)
-                    if GEOMETRIC_TARGET_WEIGHT > 0.0 and emulator is not None:
-                        # Validation logic for new MinkowskiLoss
-                        loss_g, _ = compute_geometric_loss_component(
+                    v_trust = 1.0
+
+                    if current_geom_weight > 0.0 and emulator is not None:
+                        loss_g, v_trust = compute_geometric_loss_component(
                             emulator,
                             geometric_criterion,
                             denormalizer,
@@ -514,80 +476,93 @@ def run_training(args, trial=None):
                             Y_gamma,
                             compute_trust=False,
                         )
-                val_mse_loss += loss_m.item()
-                val_geom_loss += loss_g.item()
 
+                    loss_t = loss_m + current_geom_weight * loss_g
+
+                val_total_loss += loss_t.item()
+                val_mse_loss += loss_m.item()
+                val_geom_loss += (
+                    loss_g.item() if isinstance(loss_g, torch.Tensor) else loss_g
+                )
+                val_trust_acc += v_trust
+
+        avg_val_tot = val_total_loss / len(val_loader)
         avg_val_mse = val_mse_loss / len(val_loader)
-        scheduler.step(avg_val_mse)
+        avg_val_geom = val_geom_loss / len(val_loader)
+        avg_val_trust = val_trust_acc / len(val_loader)
+
+        scheduler.step(avg_val_tot)
 
         history["epoch"].append(epoch + 1)
-        history["train_loss"].append(running_loss / len(train_loader))
-        history["val_loss"].append(avg_val_mse)
+        history["train_loss_total"].append(running_total / len(train_loader))
+        history["train_loss_mse"].append(running_mse / len(train_loader))
+        history["train_loss_geom"].append(running_geom / len(train_loader))
+        history["val_loss_total"].append(avg_val_tot)
+        history["val_loss_mse"].append(avg_val_mse)
+        history["val_loss_geom"].append(avg_val_geom)
+        history["avg_trust"].append(running_trust / len(train_loader))
         history["geom_weight"].append(current_geom_weight)
         history["learning_rate"].append(current_lr_value)
 
-        torch.save(
-            {
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scaler_state_dict": scaler.state_dict() if scaler_enabled else {},
-                "scheduler_state_dict": scheduler.state_dict(),
-                "early_stop_state": early_stopper.state_dict(),
-                "geometric_phase": geometric_phase,
-                "geometric_start_epoch": geometric_start_epoch,
-                "history": history,
-            },
-            os.path.join(out_dir, "unet_latest.pth"),
-        )
+        # Check if current validation loss is the lowest observed
+        is_best = avg_val_tot < best_val_loss
+        best_val_loss = min(best_val_loss, avg_val_tot)
+
+        checkpoint_state = {
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict() if scaler_enabled else {},
+            "scheduler_state_dict": scheduler.state_dict(),
+            "early_stop_state": early_stopper.state_dict(),
+            "history": history,
+        }
+
+        # Always save the latest checkpoint
+        torch.save(checkpoint_state, os.path.join(out_dir, "unet_latest.pth"))
+
+        # Save the best checkpoint based on total validation loss
+        if is_best:
+            torch.save(checkpoint_state, os.path.join(out_dir, "unet_best.pth"))
 
         if not trial and ((epoch + 1) % 5 == 0 or epoch == 0):
             save_sample_images(
                 model, val_loader, device, out_dir, epoch + 1, denormalizer
             )
 
-        val_metrics = {"wd": []}
-        with torch.no_grad():
-            for i, (X_val, Y_val, _) in enumerate(val_loader):
-                if i >= 10:
-                    break
-                X_val, Y_val = X_val.to(device), Y_val.to(device)
-                is_wet = X_val[:, 0].amax(dim=(1, 2)) > 1e-6
-                wet_idx = torch.where(is_wet)[0]
-                if len(wet_idx) == 0:
-                    continue
-                Y_pred_wet = model(X_val[wet_idx])
-                Y_phys = denormalizer.unnormalize(Y_val[wet_idx, 0])
-                Gen_phys = denormalizer.unnormalize(Y_pred_wet[:, 0])
-                val_metrics["wd"].append(
-                    compute_physical_metrics(Y_phys, Gen_phys)["wasserstein_dist"]
-                )
-
-        if val_metrics["wd"]:
-            mean_wd = np.mean(val_metrics["wd"])
-            best_wd_metric = min(best_wd_metric, mean_wd)
+        # --- Early Stopping Logic ---
+        # Changed from mean_wd to avg_val_mse
+        if early_stopper(avg_val_mse):
             if not trial:
-                print(f"  > Wasserstein Dist: {mean_wd:.4f}")
+                print(
+                    f"Early stopping triggered based on validation MSE plateau at epoch {epoch+1}."
+                )
+            break
 
-            if early_stopper(mean_wd):
-                if GEOMETRIC_TARGET_WEIGHT > 0.0 and not geometric_phase:
-                    if args.geom_start_epoch == -1:
-                        geometric_phase = True
-                        geometric_start_epoch = epoch + 1
-                        early_stopper.reset()
-                        optimizer = optim.AdamW(
-                            model.parameters(),
-                            lr=current_lr * 0.1,
-                            weight_decay=current_wd,
-                        )
-                        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                            optimizer,
-                            mode="min",
-                            factor=0.5,
-                            patience=scheduler_patience,
-                        )
-                else:
-                    break
+        # Optional: Physical metrics calculation (kept for logging/visualization only)
+        val_metrics = {"wd": []}
+        if not trial:
+            with torch.no_grad():
+                for i, (X_val, Y_val, _) in enumerate(val_loader):
+                    if i >= 10:
+                        break
+                    X_val, Y_val = X_val.to(device), Y_val.to(device)
+                    is_wet = X_val[:, 0].amax(dim=(1, 2)) > 1e-6
+                    wet_idx = torch.where(is_wet)[0]
+                    if len(wet_idx) == 0:
+                        continue
+                    Y_pred_wet = model(X_val[wet_idx])
+                    Y_phys = denormalizer.unnormalize(Y_val[wet_idx, 0].cpu())
+                    Gen_phys = denormalizer.unnormalize(Y_pred_wet[:, 0].cpu())
+                    val_metrics["wd"].append(
+                        compute_physical_metrics(Y_phys, Gen_phys)["wasserstein_dist"]
+                    )
+
+            if val_metrics["wd"]:
+                mean_wd = np.mean(val_metrics["wd"])
+                print(
+                    f"  > Val Tot: {avg_val_tot:.4f} | MSE: {avg_val_mse:.4f} | WD: {mean_wd:.4f}"
+                )
 
         if trial:
             trial.report(avg_val_mse, epoch)
@@ -602,20 +577,32 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--data_percentage", type=float, default=100.0)
     parser.add_argument("--tune", action="store_true")
-    parser.add_argument("--weight_geom", type=float, default=0.0)
+    parser.add_argument("--weight_geom", type=float, default=None)
     parser.add_argument(
         "--params_path", type=str, default=os.path.join(parent_path, "unet_params.yaml")
     )
-    parser.add_argument("--geom_start_epoch", type=int, default=-1)
     args = parser.parse_args()
+
+    with open(DEM_STATS, "r") as f:
+        stats_dict = json.load(f)
+    dem_stats = (float(stats_dict["dem_mean"]), float(stats_dict["dem_std"]))
+
+    try:
+        max_val_path = os.path.join(PREPROCESSED_DATA_DIR, "log_precip_max_val.npy")
+        max_val = float(np.load(max_val_path).item())
+    except FileNotFoundError:
+        print(f"Warning: Scaling stats not found at {max_val_path}. Defaulting to 1.0.")
+        max_val = 1.0
 
     if args.tune:
         study = optuna.create_study(direction="minimize")
-        study.optimize(lambda trial: run_training(args, trial), n_trials=10)
+        study.optimize(
+            lambda trial: run_training(args, dem_stats, max_val, trial), n_trials=10
+        )
         with open(os.path.join(parent_path, "unet_params.yaml"), "w") as f:
             yaml.dump(study.best_params, f)
     else:
-        run_training(args)
+        run_training(args, dem_stats, max_val)
 
 
 if __name__ == "__main__":

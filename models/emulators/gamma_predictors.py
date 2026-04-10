@@ -8,23 +8,6 @@ import math
 # ==========================================
 
 
-# class ScaledSpectralConv2d(nn.Module):
-#     """
-#     Applies spectral normalization and scales the output to target Lipschitz constant L.
-#     """
-#     def __init__(self, in_channels, out_channels, kernel_size, lipschitz_c=1.0, **kwargs):
-#         super().__init__()
-#         self.lipschitz_c = lipschitz_c
-#         # Apply standard spectral normalization (bounds L to 1)
-#         self.conv = nn.utils.spectral_norm(
-#             nn.Conv2d(in_channels, out_channels, kernel_size, **kwargs)
-#         )
-
-#     def forward(self, x):
-#         # Scale output to achieve the desired Lipschitz constant
-#         return self.lipschitz_c * self.conv(x)
-
-
 class RobustBlock(nn.Module):
     """
     Standard ResBlock with GroupNorm.
@@ -45,7 +28,7 @@ class RobustBlock(nn.Module):
         out = self.conv1(out)
         out = F.gelu(self.gn2(out))
         out = self.conv2(out)
-        return (residual + out) / 2.0  # Normalize to maintain Lipschitz constant
+        return (residual + out) / 2.0
 
 
 # ==========================================
@@ -56,10 +39,6 @@ class RobustBlock(nn.Module):
 class BaselineCNN(nn.Module):
     """
     Standard 'Black Box' CNN.
-    - No Spectral Norm (Prone to exploding/vanishing gradients)
-    - MaxPool (Aliasing/Shift-Variance)
-    - ReLU (Dead neurons)
-    - GlobalAvgPool (Destroys count/mass information)
     """
 
     def __init__(self, n_quantiles=30, input_shape=(1, 128, 128)):
@@ -83,18 +62,16 @@ class BaselineCNN(nn.Module):
         self.flatten_dim = 256
         self.head_A = nn.Linear(self.flatten_dim, n_quantiles)
         self.head_P = nn.Linear(self.flatten_dim, n_quantiles)
-        self.head_CC = nn.Linear(self.flatten_dim, n_quantiles)
+        self.head_B0 = nn.Linear(self.flatten_dim, n_quantiles)
 
     def forward(self, x):
-        # Direct pass to feature extractor
         feat = self.features(x).flatten(1)
 
         pred_A = F.relu(self.head_A(feat))
         pred_P = F.relu(self.head_P(feat))
-        pred_B0 = F.relu(self.head_CC(feat))
-        pred_B1 = F.relu(self.head_CC(feat))
+        pred_B0 = F.relu(self.head_B0(feat))
 
-        return torch.stack([pred_A, pred_P, pred_B0, pred_B1], dim=1)
+        return torch.stack([pred_A, pred_P, pred_B0], dim=1)
 
 
 # ==========================================
@@ -127,16 +104,14 @@ class LipschitzCNN(nn.Module):
         self.res4 = RobustBlock(256)
 
         self.res5 = RobustBlock(256)
-
         self.fc = nn.Linear(256, 256)
 
         self.head_A = nn.Linear(256, n_quantiles)
         self.head_P = nn.Linear(256, n_quantiles)
-        self.head_CC = nn.Linear(256, n_quantiles)
+        self.head_B0 = nn.Linear(256, n_quantiles)
 
     def forward(self, x):
         x = F.gelu(self.entry(x))
-
         x = self.pool1(x)
         x = self.res1(x)
 
@@ -157,10 +132,9 @@ class LipschitzCNN(nn.Module):
 
         pred_A = F.softplus(self.head_A(latent))
         pred_P = F.softplus(self.head_P(latent))
-        pred_B0 = F.softplus(self.head_CC(latent))
-        pred_B1 = F.softplus(self.head_CC(latent))
+        pred_B0 = F.softplus(self.head_B0(latent))
 
-        return torch.stack([pred_A, pred_P, pred_B0, pred_B1], dim=1)
+        return torch.stack([pred_A, pred_P, pred_B0], dim=1)
 
 
 # ==========================================
@@ -206,7 +180,7 @@ class ConstrainedLipschitzCNN(nn.Module):
         self.head_A_total = nn.Linear(256, 1)
         self.head_A_logits = nn.Linear(256, n_quantiles)
         self.head_P_roughness = nn.Linear(256, n_quantiles)
-        self.head_CC = nn.Linear(256, n_quantiles)
+        self.head_B0 = nn.Linear(256, n_quantiles)
 
         self._init_weights()
 
@@ -227,7 +201,6 @@ class ConstrainedLipschitzCNN(nn.Module):
         nn.init.constant_(self.head_A_logits.bias, 0)
 
     def forward(self, x):
-        # Expected input is [0, 1]
         epsilon = 1e-6
 
         x = F.gelu(self.entry(x))
@@ -261,8 +234,7 @@ class ConstrainedLipschitzCNN(nn.Module):
         R = 1.0 + F.softplus(self.head_P_roughness(latent))
         pred_P = P_min * R
 
-        # --- Head 3-4: CC ---
-        pred_B0 = F.softplus(self.head_CC(latent))
-        pred_B1 = F.softplus(self.head_CC(latent))
+        # --- Head 3: B0 ---
+        pred_B0 = F.softplus(self.head_B0(latent))
 
-        return torch.stack([pred_A, pred_P, pred_B0, pred_B1], dim=1)
+        return torch.stack([pred_A, pred_P, pred_B0], dim=1)

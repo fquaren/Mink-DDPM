@@ -13,7 +13,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Project imports
-from data.dataset import DiffusionSRDataset
+from data.dataset import DeterministicSRDataset
 from utils import load_emulator
 
 
@@ -61,7 +61,7 @@ def calibrate_tau_log_space():
     dem_stats = (float(stats["dem_mean"]), float(stats["dem_std"]))
 
     print("Initializing Dataset...")
-    val_dataset = DiffusionSRDataset(
+    val_dataset = DeterministicSRDataset(
         preprocessed_data_dir=config["PREPROCESSED_DATA_DIR"],
         metadata_file=config["VAL_METADATA_FILE"],
         dem_patches_dir=config["DEM_DATA_DIR"],

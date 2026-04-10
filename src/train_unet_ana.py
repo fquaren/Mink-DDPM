@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 import yaml
 import os
@@ -12,6 +12,10 @@ import time
 import sys
 import argparse
 import optuna
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import copy
+from scipy.stats import wasserstein_distance
 
 # --- Config & Path Setup ---
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +28,7 @@ with open(config_path, "r") as file:
 
 from models.SR.deterministic.unet import LogSpaceResidualUNet
 from data.dataset import DeterministicSRDataset
+from loss import AnalyticalMinkowskiLoss
 
 # Hyperparameters
 PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
@@ -34,101 +39,172 @@ METADATA_VAL = config["VAL_METADATA_FILE"]
 BATCH_SIZE = config["BATCH_SIZE"]
 NUM_WORKERS = config["NUM_WORKERS"]
 QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
-GEOMETRIC_WEIGHT = config.get("MINKOWSKI_TARGET_WEIGHT", 1.0)
+PATIENCE = config.get("PATIENCE", 7)
 
 
 # ------------------------------------------------------------------------------
-# 1. Analytical Loss Module
+# 1. Utilities
 # ------------------------------------------------------------------------------
-class AnalyticalMinkowskiLoss(nn.Module):
-    def __init__(self, thresholds, init_factor=0.1, min_temp=1e-3):
-        super().__init__()
-        self.register_buffer(
-            "thresholds", torch.tensor(thresholds, dtype=torch.float32)
+class DataDenormalizer:
+    def __init__(self, max_val):
+        self.max_val = max_val
+
+    def unnormalize(self, x_norm):
+        if isinstance(x_norm, torch.Tensor):
+            x_norm = x_norm.cpu().numpy()
+        x_scaled = x_norm * self.max_val
+        x_phys = np.expm1(x_scaled)
+        return np.maximum(x_phys, 0.0)
+
+    def unnormalize_torch(self, x_norm):
+        max_val_tensor = torch.tensor(
+            self.max_val, device=x_norm.device, dtype=x_norm.dtype
         )
+        x_scaled = x_norm * max_val_tensor
+        x_scaled = torch.clamp(x_scaled, max=50.0)
+        x_phys = torch.expm1(x_scaled)
+        return F.relu(x_phys)
 
-        base_temps = np.maximum(np.array(thresholds) * init_factor, min_temp)
-        self.register_buffer(
-            "base_temps", torch.tensor(base_temps, dtype=torch.float32)
-        )
 
-    def forward(self, pred_phys, target_gamma_log, anneal_factor=1.0):
-        """
-        pred_phys: Tensor [B, 1, H, W] in physical space.
-        target_gamma_log: Tensor [B, 4, Q] containing log1p-transformed targets.
-        """
-        B, _, H, W = pred_phys.shape
-        areas, perimeters, eulers = [], [], []
+class EarlyStopping:
+    def __init__(self, patience=7, delta=0, verbose=False):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.inf
+        self.delta = delta
 
-        for q_idx, thresh in enumerate(self.thresholds):
-            current_temp = self.base_temps[q_idx] * anneal_factor
+    def __call__(self, val_loss):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.val_loss_min = val_loss
+            return False
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+                return True
+            return False
+        else:
+            self.best_score = score
+            self.val_loss_min = val_loss
+            self.counter = 0
+            return False
 
-            p = torch.sigmoid((pred_phys - thresh) / current_temp)
+    def reset(self):
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.inf
 
-            area = torch.sum(p, dim=(1, 2, 3))
+    def state_dict(self):
+        return {
+            "patience": self.patience,
+            "counter": self.counter,
+            "best_score": self.best_score,
+            "early_stop": self.early_stop,
+            "val_loss_min": self.val_loss_min,
+            "delta": self.delta,
+        }
 
-            dx = p[:, :, :, 1:] - p[:, :, :, :-1]
-            dy = p[:, :, 1:, :] - p[:, :, :-1, :]
-            perimeter = torch.sum(
-                torch.sqrt(dx[:, :, :-1, :] ** 2 + dy[:, :, :, :-1] ** 2 + 1e-8),
-                dim=(1, 2, 3),
-            )
+    def load_state_dict(self, state_dict):
+        self.patience = state_dict["patience"]
+        self.counter = state_dict["counter"]
+        self.best_score = state_dict["best_score"]
+        self.early_stop = state_dict["early_stop"]
+        self.val_loss_min = state_dict["val_loss_min"]
+        self.delta = state_dict["delta"]
 
-            V = torch.sum(p, dim=(1, 2, 3))
-            E_x = torch.sum(p[:, :, :, :-1] * p[:, :, :, 1:], dim=(1, 2, 3))
-            E_y = torch.sum(p[:, :, :-1, :] * p[:, :, 1:, :], dim=(1, 2, 3))
-            F = torch.sum(
-                p[:, :, :-1, :-1]
-                * p[:, :, :-1, 1:]
-                * p[:, :, 1:, :-1]
-                * p[:, :, 1:, 1:],
-                dim=(1, 2, 3),
-            )
-            euler = V - E_x - E_y + F
 
-            areas.append(area)
-            perimeters.append(perimeter)
-            eulers.append(euler)
+def save_sample_images(model, loader, device, out_dir, epoch, denormalizer):
+    model.eval()
+    X_batch, Y_batch, _ = next(iter(loader))
+    X_batch = X_batch.to(device, non_blocking=True)
+    Y_batch = Y_batch.to(device, non_blocking=True)
 
-        pred_gamma_phys = torch.stack(
-            [
-                torch.stack(areas, dim=1),
-                torch.stack(perimeters, dim=1),
-                torch.stack(eulers, dim=1),
-            ],
-            dim=1,
-        )
+    X_phys = denormalizer.unnormalize_torch(X_batch[:, 0])
+    total_precip = X_phys.sum(dim=(1, 2))
+    max_idx = total_precip.argmax().item()
+    X_sample = X_batch[max_idx : max_idx + 1]
+    Y_sample = Y_batch[max_idx : max_idx + 1]
 
-        pred_gamma_log = torch.sign(pred_gamma_phys) * torch.log1p(
-            torch.abs(pred_gamma_phys)
-        )
+    with torch.no_grad():
+        with torch.amp.autocast("cuda" if "cuda" in str(device) else "cpu"):
+            x_generated = model(X_sample)
 
-        # Exact inverse transform to linear space
-        target_raw = torch.sign(target_gamma_log) * torch.expm1(
-            torch.abs(target_gamma_log)
-        )
+    X_norm = X_sample[:, 0].float().cpu().numpy()
+    Y_norm = Y_sample[:, 0].float().cpu().numpy()
+    Gen_norm = x_generated[:, 0].float().cpu().clamp(0.0, 1.0).numpy()
 
-        target_area = target_raw[:, 0, :]
-        target_perim = target_raw[:, 1, :]
-        target_euler = target_raw[:, 2, :] - target_raw[:, 3, :]
+    img_in = denormalizer.unnormalize(X_norm)[0]
+    img_target = denormalizer.unnormalize(Y_norm)[0]
+    img_gen = denormalizer.unnormalize(Gen_norm)[0]
 
-        target_gamma_processed = torch.stack(
-            [target_area, target_perim, target_euler], dim=1
-        )
+    os.makedirs(out_dir, exist_ok=True)
+    data_path = os.path.join(out_dir, f"sample_data_epoch_{epoch:03d}.npz")
+    np.savez_compressed(
+        data_path, img_in=img_in, img_target=img_target, img_gen=img_gen
+    )
 
-        # Re-apply log transform to the combined tensor
-        target_gamma_log_processed = torch.sign(target_gamma_processed) * torch.log1p(
-            torch.abs(target_gamma_processed)
-        )
+    precip_cmap = copy.copy(plt.get_cmap("Blues"))
+    precip_cmap.set_bad(color="lightgrey", alpha=1.0)
 
-        abs_diff = torch.abs(pred_gamma_log - target_gamma_log_processed.float())
-        dist = torch.trapezoid(abs_diff, self.thresholds, dim=2)
+    def mask_low_values(img, threshold=0.1):
+        masked = img.copy()
+        masked[masked <= threshold] = np.nan
+        return masked
 
-        return dist.sum(dim=1).mean()
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+    vmax = max(
+        np.nanmax([np.nanmax(img_in), np.nanmax(img_target), np.nanmax(img_gen)]), 1.0
+    )
+    norm = mcolors.Normalize(vmin=0, vmax=vmax)
+
+    axs[0].imshow(mask_low_values(img_in), cmap=precip_cmap, norm=norm, origin="lower")
+    axs[0].set_title(f"Input (LR) | Max: {np.nanmax(img_in):.2f}")
+    axs[0].axis("off")
+
+    axs[1].imshow(mask_low_values(img_gen), cmap=precip_cmap, norm=norm, origin="lower")
+    axs[1].set_title(f"Generated (SR) | Max: {np.nanmax(img_gen):.2f}")
+    axs[1].axis("off")
+
+    im3 = axs[2].imshow(
+        mask_low_values(img_target), cmap=precip_cmap, norm=norm, origin="lower"
+    )
+    axs[2].set_title(f"Target (HR) | Max: {np.nanmax(img_target):.2f}")
+    axs[2].axis("off")
+
+    plt.colorbar(im3, ax=axs[2], fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(out_dir, f"sample_epoch_{epoch:03d}.png"),
+        bbox_inches="tight",
+        dpi=100,
+    )
+    plt.close()
+
+
+def compute_physical_metrics(real_batch, gen_batch, drizzle_threshold=0.1):
+    real_batch = real_batch * (real_batch > drizzle_threshold).astype(float)
+    gen_batch = gen_batch * (gen_batch > drizzle_threshold).astype(float)
+    real_flat, gen_flat = real_batch.flatten(), gen_batch.flatten()
+    if len(real_flat) == 0 or len(gen_flat) == 0:
+        return {"wasserstein_dist": 0.0, "max_intensity_err": 0.0}
+    wd = wasserstein_distance(real_flat, gen_flat)
+    max_err = abs(np.max(real_flat) - np.max(gen_flat)) if len(real_flat) > 0 else 0
+    return {"wasserstein_dist": wd, "max_intensity_err": max_err}
 
 
 # ------------------------------------------------------------------------------
 # 2. Training Loop & Optuna Objective
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Modified Training Loop for Script 1 (Analytical Version)
 # ------------------------------------------------------------------------------
 def objective(trial, args, dem_stats, max_val):
     device = torch.device(
@@ -139,10 +215,31 @@ def objective(trial, args, dem_stats, max_val):
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
 
-    # Optuna suggestions
-    lr = trial.suggest_float("lr", 1e-5, 5e-3, log=True)
-    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    trial_str = f"_trial_{trial.number}" if trial else ""
+    out_dir = os.path.join(
+        "sr_experiment_runs", f"UNet_AnalyticalBaseline{trial_str}_{timestamp}"
+    )
+    if not args.tune:
+        os.makedirs(out_dir, exist_ok=True)
+
+    denormalizer = DataDenormalizer(max_val)
+
+    if trial:
+        lr = trial.suggest_float("lr", 1e-5, 5e-3, log=True)
+        weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+    else:
+        lr = getattr(args, "lr", 1e-3)
+        weight_decay = getattr(args, "weight_decay", 1e-4)
+
     epochs = args.optuna_epochs if args.tune else config["NUM_EPOCHS"]
+
+    # This acts as w_max in the cosine schedule
+    GEOMETRIC_WEIGHT = (
+        args.weight_geom
+        if args.weight_geom is not None
+        else config.get("MINKOWSKI_TARGET_WEIGHT", 1.0)
+    )
 
     train_dataset = DeterministicSRDataset(
         PREPROCESSED_DATA_DIR,
@@ -154,104 +251,245 @@ def objective(trial, args, dem_stats, max_val):
         load_in_ram=False,
         data_percentage=args.data_percentage,
     )
-
-    # Dataset subsetting
-    dataset_size = len(train_dataset)
-    subset_size = int(dataset_size * args.data_percentage / 100.0)
-    indices = np.arange(subset_size)
-
-    subset_dataset = Subset(train_dataset, indices)
-    subset_weights = train_dataset.sample_weights[indices]
-
-    sampler = WeightedRandomSampler(
-        weights=subset_weights, num_samples=len(subset_dataset), replacement=True
+    val_dataset = DeterministicSRDataset(
+        PREPROCESSED_DATA_DIR,
+        METADATA_VAL,
+        DEM_DATA_DIR,
+        dem_stats,
+        scaler_max_val=max_val,
+        split="validation",
+        load_in_ram=False,
+        data_percentage=args.data_percentage,
     )
 
     train_loader = DataLoader(
-        dataset=subset_dataset,
+        dataset=train_dataset,
         batch_size=BATCH_SIZE,
-        sampler=sampler,
+        sampler=WeightedRandomSampler(
+            weights=train_dataset.sample_weights,
+            num_samples=len(train_dataset),
+            replacement=True,
+        ),
+        num_workers=NUM_WORKERS,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
+        pin_memory=True,
     )
 
     model = LogSpaceResidualUNet(in_channels=2, out_channels=1).to(device)
-    criterion_geom = AnalyticalMinkowskiLoss(thresholds=QUANTILE_LEVELS).to(device)
     criterion_mse = nn.MSELoss()
+    criterion_geom = AnalyticalMinkowskiLoss(thresholds=QUANTILE_LEVELS).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+    # Removed dynamic weights from AdamW parameters
+    optimizer = optim.AdamW(
+        [{"params": model.parameters()}], lr=lr, weight_decay=weight_decay
+    )
+
+    scheduler_patience = max(1, PATIENCE // 2)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=scheduler_patience
+    )
+    early_stopper = EarlyStopping(patience=PATIENCE, verbose=not bool(trial))
+
+    scaler_enabled = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
     max_val_tensor = torch.tensor(max_val, device=device, dtype=torch.float32)
 
-    final_loss = float("inf")
+    best_val_loss = float("inf")
 
-    for epoch in range(epochs):
+    # Replaced log_var keys with geom_weight
+    history = {
+        "epoch": [],
+        "train_loss_total": [],
+        "train_loss_mse": [],
+        "train_loss_geom": [],
+        "val_loss_total": [],
+        "val_loss_mse": [],
+        "val_loss_geom": [],
+        "geom_weight": [],
+        "learning_rate": [],
+    }
+
+    start_epoch = 0
+    if getattr(args, "resume", None) and os.path.isfile(args.resume) and not trial:
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if scaler_enabled:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        start_epoch = checkpoint["epoch"]
+        early_stopper.load_state_dict(checkpoint["early_stop_state"])
+        history = checkpoint.get("history", history)
+
+    for epoch in range(start_epoch, epochs):
         current_anneal_factor = max(0.05, np.exp(-3.0 * epoch / epochs))
+        current_lr_value = optimizer.param_groups[0]["lr"]
+
+        # Calculate cosine annealing schedule for current epoch
+        w_min = 0.0
+        current_geom_weight = w_min + 0.5 * (GEOMETRIC_WEIGHT - w_min) * (
+            1 + np.cos(np.pi * epoch / epochs)
+        )
 
         model.train()
-        running_total_loss = 0.0
+        running_total_loss, running_mse_loss, running_geom_loss = 0.0, 0.0, 0.0
 
         pbar = tqdm(
-            train_loader, desc=f"Trial {trial.number} | Epoch {epoch+1}/{epochs}"
+            train_loader,
+            desc=f"Trial {trial.number if trial else ''} | Epoch {epoch+1}/{epochs} [W_geom={current_geom_weight:.4f}]",
+            mininterval=15.0,
         )
         for X, Y_norm, Y_gamma_log in pbar:
             X, Y_norm, Y_gamma_log = (
-                X.to(device),
-                Y_norm.to(device),
-                Y_gamma_log.to(device),
+                X.to(device, non_blocking=True),
+                Y_norm.to(device, non_blocking=True),
+                Y_gamma_log.to(device, non_blocking=True),
             )
 
             optimizer.zero_grad()
 
             with torch.amp.autocast(
-                "cuda" if device.type == "cuda" else "cpu",
-                enabled=(device.type == "cuda"),
+                "cuda" if device.type == "cuda" else "cpu", enabled=scaler_enabled
             ):
                 Y_pred_norm = model(X)
-
                 loss_mse = criterion_mse(Y_pred_norm, Y_norm)
+                loss_geom = torch.tensor(0.0, device=device)
 
-                pred_scaled = torch.clamp(Y_pred_norm[:, 0:1] * max_val_tensor, max=7.0)
-                pred_phys = F.relu(torch.expm1(pred_scaled))
+                if current_geom_weight > 0.0:
+                    pred_scaled = torch.clamp(
+                        Y_pred_norm[:, 0:1] * max_val_tensor, max=7.0
+                    )
+                    pred_phys = F.relu(torch.expm1(pred_scaled))
+                    loss_geom = criterion_geom(
+                        pred_phys, Y_gamma_log, anneal_factor=current_anneal_factor
+                    )
 
-                loss_geom = criterion_geom(
-                    pred_phys, Y_gamma_log, anneal_factor=current_anneal_factor
-                )
-                total_loss = loss_mse + (GEOMETRIC_WEIGHT * loss_geom)
+                # Linear combination using scheduled weight
+                total_loss = loss_mse + current_geom_weight * loss_geom
 
             scaler.scale(total_loss).backward()
-
-            # Gradient clipping to prevent explosion from exponentiated space
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
             scaler.step(optimizer)
             scaler.update()
 
             running_total_loss += total_loss.item()
-            pbar.set_postfix(
-                Total=f"{total_loss.item():.4f}", MSE=f"{loss_mse.item():.4f}"
+            running_mse_loss += loss_mse.item()
+            running_geom_loss += (
+                loss_geom.item() if isinstance(loss_geom, torch.Tensor) else loss_geom
             )
 
-        final_loss = running_total_loss / len(train_loader)
+            if not args.tune:
+                pbar.set_postfix(
+                    Tot=f"{total_loss.item():.3f}",
+                    MSE=f"{loss_mse.item():.4f}",
+                    Geom=f"{loss_geom.item() if isinstance(loss_geom, torch.Tensor) else loss_geom:.4f}",
+                )
 
-        # Report intermediate values to Optuna for pruning unpromising trials
-        trial.report(final_loss, epoch)
-        if trial.should_prune():
-            raise optuna.exceptions.TrialPruned()
+        avg_train_tot = running_total_loss / len(train_loader)
+        avg_train_mse = running_mse_loss / len(train_loader)
+        avg_train_geom = running_geom_loss / len(train_loader)
+
+        model.eval()
+        val_total_loss, val_mse_loss, val_geom_loss = 0.0, 0.0, 0.0
+
+        with torch.no_grad():
+            for X, Y_norm, Y_gamma_log in val_loader:
+                X, Y_norm, Y_gamma_log = (
+                    X.to(device, non_blocking=True),
+                    Y_norm.to(device, non_blocking=True),
+                    Y_gamma_log.to(device, non_blocking=True),
+                )
+                with torch.amp.autocast(
+                    "cuda" if device.type == "cuda" else "cpu", enabled=scaler_enabled
+                ):
+                    Y_pred_norm = model(X)
+                    loss_m = criterion_mse(Y_pred_norm, Y_norm)
+                    loss_g = torch.tensor(0.0, device=device)
+
+                    if current_geom_weight > 0.0:
+                        pred_scaled = torch.clamp(
+                            Y_pred_norm[:, 0:1] * max_val_tensor, max=7.0
+                        )
+                        pred_phys = F.relu(torch.expm1(pred_scaled))
+                        loss_g = criterion_geom(
+                            pred_phys, Y_gamma_log, anneal_factor=current_anneal_factor
+                        )
+
+                    loss_t = loss_m + current_geom_weight * loss_g
+
+                val_total_loss += loss_t.item()
+                val_mse_loss += loss_m.item()
+                val_geom_loss += (
+                    loss_g.item() if isinstance(loss_g, torch.Tensor) else loss_g
+                )
+
+        avg_val_tot = val_total_loss / len(val_loader)
+        avg_val_mse = val_mse_loss / len(val_loader)
+        avg_val_geom = val_geom_loss / len(val_loader)
+
+        scheduler.step(avg_val_tot)
+
+        history["epoch"].append(epoch + 1)
+        history["train_loss_total"].append(avg_train_tot)
+        history["train_loss_mse"].append(avg_train_mse)
+        history["train_loss_geom"].append(avg_train_geom)
+        history["val_loss_total"].append(avg_val_tot)
+        history["val_loss_mse"].append(avg_val_mse)
+        history["val_loss_geom"].append(avg_val_geom)
+        history["geom_weight"].append(current_geom_weight)
+        history["learning_rate"].append(current_lr_value)
+
+        # Check if current validation loss is the lowest observed
+        # Note: We keep avg_val_tot for saving the 'best' weights as it includes the physics constraint
+        is_best = avg_val_tot < best_val_loss
+        best_val_loss = min(best_val_loss, avg_val_tot)
+
+        if not args.tune:
+            checkpoint_state = {
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict() if scaler_enabled else {},
+                "scheduler_state_dict": scheduler.state_dict(),
+                "early_stop_state": early_stopper.state_dict(),
+                "history": history,
+            }
+            torch.save(checkpoint_state, os.path.join(out_dir, "unet_latest.pth"))
+            if is_best:
+                torch.save(checkpoint_state, os.path.join(out_dir, "unet_best.pth"))
+
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                save_sample_images(
+                    model, val_loader, device, out_dir, epoch + 1, denormalizer
+                )
+
+        # --- Early Stopping & Reporting (Modified to MSE) ---
+        if trial:
+            trial.report(avg_val_mse, epoch)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+
+        # Trigger early stopping based on validation MSE
+        if early_stopper(avg_val_mse):
+            if not args.tune:
+                print(
+                    f"Early stopping triggered based on validation MSE at epoch {epoch+1}."
+                )
+            break
 
     if not args.tune:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_dir = os.path.join(
-            "sr_experiment_runs", f"UNet_AnalyticalBaseline_{timestamp}"
-        )
-        os.makedirs(out_dir, exist_ok=True)
         torch.save(
             {"model_state_dict": model.state_dict()},
             os.path.join(out_dir, "unet_ana_final.pth"),
         )
 
-    return final_loss
+    return best_val_loss
 
 
 # ------------------------------------------------------------------------------
@@ -261,6 +499,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Train deterministic UNet with Minkowski Loss."
     )
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint.")
     parser.add_argument(
         "--data_percentage",
         type=float,
@@ -269,6 +508,12 @@ def main():
     )
     parser.add_argument(
         "--tune", action="store_true", help="Run Optuna hyperparameter tuning."
+    )
+    parser.add_argument(
+        "--weight_geom",
+        type=float,
+        default=None,
+        help="Static scaling weight for the geometric loss. Overrides config value.",
     )
     parser.add_argument(
         "--params_path", type=str, default=os.path.join(parent_path, "unet_params.yaml")
@@ -323,8 +568,8 @@ def main():
                 f"No best hyperparameters found at {best_params_path}. Using defaults."
             )
 
-        final_loss = objective(optuna.trial.FixedTrial({}), args, dem_stats, max_val)
-        print(f"Final training loss: {final_loss:.4f}")
+        final_loss = objective(None, args, dem_stats, max_val)
+        print(f"Final best validation loss: {final_loss:.4f}")
 
 
 if __name__ == "__main__":

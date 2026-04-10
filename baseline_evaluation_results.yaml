@@ -1,0 +1,52 @@
+Analytical_Approximation:
+  Isoperimetric_Violation_Pct: !!python/object/apply:numpy._core.multiarray.scalar
+  - !!python/object/apply:numpy.dtype
+    args:
+    - f8
+    - false
+    - true
+    state: !!python/tuple
+    - 3
+    - <
+    - null
+    - null
+    - null
+    - -1
+    - -1
+    - 0
+  - !!binary |
+    ccoQbkla0T8=
+  MSE_Total: 0.4893230199813843
+  Minkowski_Area: !!python/object/apply:numpy._core.multiarray.scalar
+  - &id001 !!python/object/apply:numpy.dtype
+    args:
+    - f4
+    - false
+    - true
+    state: !!python/tuple
+    - 3
+    - <
+    - null
+    - null
+    - null
+    - -1
+    - -1
+    - 0
+  - !!binary |
+    TS12PA==
+  Minkowski_Euler: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    obnYPg==
+  Minkowski_Perimeter: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    1kkWPw==
+  Minkowski_Total: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    rj+DPw==
+  R2_Area: 0.9998794198036194
+  R2_Euler: 0.1348004937171936
+  R2_Perimeter: 0.9221285581588745
+  R2_Total: 0.6719195246696472

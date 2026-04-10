@@ -19,9 +19,10 @@ parent_path = os.path.dirname(
 if parent_path not in sys.path:
     sys.path.insert(0, parent_path)
 
-from models.SR.ddpm.ddpm import ContextUnet
-from models.SR.ddpm.diffusion import Diffusion
-from data.dataset import DiffusionSRDataset
+print(f"Project root added to sys.path: {parent_path}")
+
+from models.SR.deterministic.unet import LogSpaceResidualUNet
+from data.dataset import DeterministicSRDataset
 from src.loss import AnalyticalMinkowskiLoss
 
 # --- Metric Implementations ---
@@ -51,13 +52,20 @@ class DataDenormalizer:
 def compute_fss(pred, target, threshold, window_size):
     pred_bin = (pred >= threshold).float()
     target_bin = (target >= threshold).float()
+
     pad = window_size // 2
     pool = nn.AvgPool2d(
         kernel_size=window_size, stride=1, padding=pad, count_include_pad=False
     )
-    mse = ((pool(pred_bin) - pool(target_bin)) ** 2).mean(dim=(1, 2, 3))
-    ref = (pool(pred_bin) ** 2 + pool(target_bin) ** 2).mean(dim=(1, 2, 3))
-    return (1.0 - (mse / (ref + 1e-8))).mean().item()
+
+    pred_frac = pool(pred_bin)
+    target_frac = pool(target_bin)
+
+    mse = ((pred_frac - target_frac) ** 2).mean(dim=(1, 2, 3))
+    ref = (pred_frac**2 + target_frac**2).mean(dim=(1, 2, 3))
+
+    fss = 1.0 - (mse / (ref + 1e-8))
+    return fss.mean().item()
 
 
 def compute_wasserstein(pred_phys, target_phys, drizzle_threshold=0.1):
@@ -71,6 +79,7 @@ def compute_wasserstein(pred_phys, target_phys, drizzle_threshold=0.1):
 def compute_spectral_loss(pred, target):
     pred_fft = torch.fft.fft2(pred.float())
     target_fft = torch.fft.fft2(target.float())
+
     pred_mag = torch.log(torch.abs(torch.fft.fftshift(pred_fft)) + 1e-8)
     target_mag = torch.log(torch.abs(torch.fft.fftshift(target_fft)) + 1e-8)
     return F.l1_loss(pred_mag, target_mag).item()
@@ -80,18 +89,22 @@ def _get_sal_features(field, thr=0.1):
     R = np.mean(field)
     if R <= 1e-8:
         return 0.0, np.array([0.0, 0.0]), 0.0
+
     mask = field >= thr
     labeled_array, num_obj = label(mask)
     if num_obj == 0:
         return R, np.array(field.shape) / 2.0, 0.0
+
     V_sum = 0.0
     R_sum = np.sum(field[mask])
+
     for i in range(1, num_obj + 1):
         obj_mask = labeled_array == i
         R_n = np.sum(field[obj_mask])
         R_n_max = np.max(field[obj_mask])
         V_n = R_n / (R_n_max + 1e-8)
         V_sum += V_n * R_n
+
     V = V_sum / (R_sum + 1e-8)
     com = np.array(center_of_mass(field))
     return R, com, V
@@ -100,40 +113,42 @@ def _get_sal_features(field, thr=0.1):
 def compute_sal(pred, target, thr=0.1):
     R_p, com_p, V_p = _get_sal_features(pred, thr)
     R_t, com_t, V_t = _get_sal_features(target, thr)
+
     den_A = 0.5 * (R_p + R_t)
     A = (R_p - R_t) / den_A if den_A > 1e-8 else 0.0
+
     den_S = 0.5 * (V_p + V_t)
     S = (V_p - V_t) / den_S if den_S > 1e-8 else 0.0
+
     d = np.hypot(pred.shape[0], pred.shape[1])
     L = np.linalg.norm(com_p - com_t) / d if den_A > 1e-8 else 0.0
+
     return S, A, L
 
 
 def compute_raps(image):
     image = np.squeeze(image)
     npix = image.shape[0]
-    fourier_amplitudes = np.abs(np.fft.fftn(image)) ** 2
+    fourier_image = np.fft.fftn(image)
+    fourier_amplitudes = np.abs(fourier_image) ** 2
     kfreq = np.fft.fftfreq(npix) * npix
     kfreq2D = np.meshgrid(kfreq, kfreq)
-    knrm = np.round(np.sqrt(kfreq2D[0] ** 2 + kfreq2D[1] ** 2)).astype(int)
+    knrm = np.sqrt(kfreq2D[0] ** 2 + kfreq2D[1] ** 2)
+    knrm = np.round(knrm).astype(int)
     bins = np.bincount(knrm.ravel(), fourier_amplitudes.ravel())
     return bins[: npix // 2]
 
 
 def compute_raps_error(pred, target):
-    return np.mean(
-        np.abs(
-            np.log10(compute_raps(pred) + 1e-8) - np.log10(compute_raps(target) + 1e-8)
-        )
-    )
+    raps_p = compute_raps(pred)
+    raps_t = compute_raps(target)
+    return np.mean(np.abs(np.log10(raps_p + 1e-8) - np.log10(raps_t + 1e-8)))
 
 
 # --- Main Evaluation Loop ---
 
 
 def evaluate(args):
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
@@ -153,16 +168,15 @@ def evaluate(args):
     max_val = float(np.load(max_val_path).item())
     denormalizer = DataDenormalizer(max_val)
 
-    test_dataset = DiffusionSRDataset(
+    test_dataset = DeterministicSRDataset(
         config["PREPROCESSED_DATA_DIR"],
         config.get("TEST_METADATA_FILE", config["VAL_METADATA_FILE"]),
         config["DEM_DATA_DIR"],
         dem_stats,
         scaler_max_val=max_val,
         split="test",
-        data_percentage=100.0,
+        load_in_ram=False,
     )
-
     test_loader = DataLoader(
         test_dataset,
         batch_size=config["BATCH_SIZE"],
@@ -170,12 +184,11 @@ def evaluate(args):
         num_workers=config["NUM_WORKERS"],
     )
 
-    model = ContextUnet(in_channels=1, c_in_condition=2, device=device).to(device)
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint)
+    model = LogSpaceResidualUNet(in_channels=2, out_channels=1).to(device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    diffusion = Diffusion(img_size=128, device=device)
     criterion_mae = nn.L1Loss()
     criterion_minkowski = AnalyticalMinkowskiLoss(
         thresholds=config["QUANTILE_LEVELS"]
@@ -205,26 +218,19 @@ def evaluate(args):
         },
     }
 
-    print(
-        f"Starting deterministic DDIM evaluation on {len(test_dataset)} samples using device: {device}"
-    )
+    print(f"Starting evaluation on {len(test_dataset)} samples using device: {device}")
 
     with torch.no_grad():
-        for X, Y_norm, Y_gamma_log, *_ in tqdm(test_loader, desc="Evaluating DDPM"):
+        for X, Y_norm, Y_gamma_log in tqdm(test_loader, desc="Evaluating"):
             X, Y_norm, Y_gamma_log = (
                 X.to(device),
                 Y_norm.to(device),
                 Y_gamma_log.to(device),
             )
-            Y_pred_norm = diffusion.sample_ddim(
-                model, n=X.shape[0], conditions=X, ddim_steps=args.ddim_steps
-            )
+            Y_pred_norm = model(X)
 
-            Y_pred_shifted = (Y_pred_norm[:, 0:1].clamp(-1.0, 1.0) + 1.0) / 2.0
-            Y_target_shifted = (Y_norm[:, 0:1] + 1.0) / 2.0
-
-            pred_phys = denormalizer.unnormalize_torch(Y_pred_shifted)
-            target_phys = denormalizer.unnormalize_torch(Y_target_shifted)
+            pred_phys = denormalizer.unnormalize_torch(Y_pred_norm[:, 0:1])
+            target_phys = denormalizer.unnormalize_torch(Y_norm[:, 0:1])
 
             metrics["mae_phys"].append(criterion_mae(pred_phys, target_phys).item())
             metrics["minkowski"].append(
@@ -235,11 +241,13 @@ def evaluate(args):
             )
 
             for thresh, window in metrics["fss"].keys():
-                metrics["fss"][(thresh, window)].append(
-                    compute_fss(pred_phys, target_phys, thresh, window)
+                fss_val = compute_fss(
+                    pred_phys, target_phys, threshold=thresh, window_size=window
                 )
+                metrics["fss"][(thresh, window)].append(fss_val)
 
-            p_np, t_np = pred_phys.cpu().numpy(), target_phys.cpu().numpy()
+            p_np = pred_phys.cpu().numpy()
+            t_np = target_phys.cpu().numpy()
             for b in range(p_np.shape[0]):
                 metrics["wasserstein"].append(compute_wasserstein(p_np[b], t_np[b]))
                 metrics["raps_mae"].append(compute_raps_error(p_np[b, 0], t_np[b, 0]))
@@ -267,6 +275,12 @@ def evaluate(args):
     for k, v in results.items():
         print(f"{k}: {v:.4f}")
 
+    print("\n--- Fractions Skill Score (FSS) ---")
+    for (thresh, window), vals in metrics["fss"].items():
+        print(
+            f"Threshold: {thresh:04.1f}mm | Window: {window:02d}x{window:02d} -> FSS: {np.mean(vals):.4f}"
+        )
+
     if args.save_json:
         fss_str_keys = {
             f"thresh_{t}_win_{w}": np.mean(vals)
@@ -279,9 +293,7 @@ def evaluate(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Evaluate SR DDPM model using deterministic DDIM."
-    )
+    parser = argparse.ArgumentParser(description="Evaluate SR UNet model.")
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -291,14 +303,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save_json",
         type=str,
-        default="eval_results_ddpm.json",
+        default="eval_results.json",
         help="Path to save output metrics",
-    )
-    parser.add_argument(
-        "--ddim_steps", type=int, default=50, help="Number of steps for DDIM sampling"
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42, help="Global seed for initial noise generation"
     )
     args = parser.parse_args()
     evaluate(args)

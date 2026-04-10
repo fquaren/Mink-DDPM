@@ -2,29 +2,26 @@
 
 # --- CONFIGURATION ---
 PROJECT_ROOT="/home/fquareng/work/ch2/Mink-DDPM" 
-SCRIPT_PATH="${PROJECT_ROOT}/test/test_empirical_lipschitz.py"
+SCRIPT_PATH="${PROJECT_ROOT}/eval/SR/eval_bicubic.py"
 
 # Logging setup
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="${PROJECT_ROOT}/logs"
 mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/empirical_lipschitz_test_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/unet_eval_${TIMESTAMP}.log"
 
 # --- HARDWARE SETTINGS ---
-# Explicitly set the GPU (Good practice even with 1 GPU)
 export CUDA_VISIBLE_DEVICES=0
-
-# Force Python to flush stdout/stderr immediately so you can tail the log in real-time
 export PYTHONUNBUFFERED=1
 
 export LD_LIBRARY_PATH=/work/fquareng/.micromamba/envs/dl-stable/lib:$LD_LIBRARY_PATH
 
 # --- EXECUTION ---
-echo "Starting training on RTX 6000..."
+echo "Starting evaluation for $TARGET_RUN_DIR on RTX 6000..."
 echo "Logs will be saved to: $LOG_FILE"
 
-# We redirect both stdout (1) and stderr (2) to the log file
 source /home/fquareng/.bashrc
+
 micromamba run -n dl-stable python "$SCRIPT_PATH" > "$LOG_FILE" 2>&1
 
-echo "Training finished."
+echo "Evaluation finished."

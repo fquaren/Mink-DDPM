@@ -2,9 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- Helper Classes (DoubleConv, Down, Up, SelfAttention) remain unchanged ---
-# (I have kept them condensed here to save space, paste the previous versions back if needed)
-
 
 class SelfAttention(nn.Module):
     def __init__(self, channels):
@@ -17,16 +14,12 @@ class SelfAttention(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        # Reshape to (B, H*W, C) for MultiheadAttention
         x_reshaped = x.view(B, C, H * W).swapaxes(1, 2)
         x_norm = self.ln(x_reshaped)
 
-        q = k = v = x_norm
-        attention_val = F.scaled_dot_product_attention(
-            q, k, v
-        )  # Use PyTorch's built-in function for efficiency
+        # FIX: Utilize the module with projection weights
+        attention_val, _ = self.mha(x_norm, x_norm, x_norm, need_weights=False)
 
-        # Residual connection and reshape back to (B, C, H, W)
         attention_val = attention_val.swapaxes(1, 2).view(B, C, H, W)
         return x + attention_val
 

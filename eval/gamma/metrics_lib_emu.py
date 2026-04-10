@@ -1,14 +1,15 @@
 import numpy as np
 import pandas as pd
 from sklearn.metrics import r2_score, mean_squared_error
+from tqdm import tqdm
 
 
 def _calculate_per_sample_metrics(preds, targets):
     """
-    Calculates R2, MSE, and Target Variance for each sample's vector (A, P, B0, B1).
+    Calculates R2, MSE, and Target Variance for each sample's vector (A, P, B0).
     """
-    n_samples = preds.shape[0]
-    components = ["A", "P", "B0", "B1"]
+    n_samples = len(preds)
+    components = ["A", "P", "B0"]
 
     # Initialize storage with lowercase keys for internal consistency
     metrics = {}
@@ -16,7 +17,7 @@ def _calculate_per_sample_metrics(preds, targets):
         for c in components:
             metrics[f"{m}_{c}"] = np.zeros(n_samples)
 
-    for i in range(n_samples):
+    for i in tqdm(range(n_samples), desc="Calculating Sample Metrics"):
         for j, comp in enumerate(components):
             pred_sample = preds[i, j, :]
             target_sample = targets[i, j, :]
@@ -70,17 +71,15 @@ def create_metrics_dataframe(
     all_geom_losses,
 ):
     print("\nCreating comprehensive metrics DataFrame (with MSE/Var)...")
-
-    # 1. Calculate per-sample metrics
     sample_metrics = _calculate_per_sample_metrics(all_preds_phys, all_targets_phys)
-
-    # 2. Mean precip
     mean_precip = np.mean(all_original_images, axis=(1, 2))
 
-    # 3. Build DataFrame
+    # Unpack the N x 3 array into three 1D arrays of shape (N,)
     data = {
         "total_loss": all_total_losses,
-        "geom_loss": all_geom_losses,
+        "geom_loss_A": all_geom_losses[:, 0],
+        "geom_loss_P": all_geom_losses[:, 1],
+        "geom_loss_B0": all_geom_losses[:, 2],
         "mean_precip": mean_precip,
     }
     data.update(sample_metrics)
@@ -88,7 +87,7 @@ def create_metrics_dataframe(
     df = pd.DataFrame(data)
     df["precip_group"] = _get_precipitation_groups(df["mean_precip"])
 
-    # Optional: Add objects for plotting (heavy memory usage)
+    # Restore the omitted object columns
     df["target_image"] = [img for img in all_original_images]
     df["pred_gamma"] = [gamma for gamma in all_preds_phys]
     df["target_gamma"] = [gamma for gamma in all_targets_phys]
@@ -103,10 +102,15 @@ def calculate_grouped_metrics(metrics_df):
     """
     print("\nCalculating sample-wise metrics by precipitation group...")
 
-    # Define logical column order for the output
-    # We want to see R2, MSE, Var side-by-side for each component
-    ordered_cols = ["total_loss", "geom_loss"]
-    for comp in ["A", "P", "B0", "B1"]:
+    # Explicitly list the newly unpacked geometric loss components
+    ordered_cols = [
+        "total_loss",
+        "geom_loss_A",
+        "geom_loss_P",
+        "geom_loss_B0",
+    ]
+
+    for comp in ["A", "P", "B0"]:
         ordered_cols.extend([f"R2_{comp}", f"MSE_{comp}", f"Var_{comp}"])
 
     # Group and Mean
@@ -135,7 +139,7 @@ def calculate_global_group_metrics(metrics_df, all_preds, all_targets):
     print("\nCalculating global component-wise metrics...")
 
     groups = ["Zero", "Low", "Mid", "High", "All"]
-    components = ["A", "P", "B0", "B1"]
+    components = ["A", "P", "B0"]
 
     results = {
         metric: {g: {c: np.nan for c in components} for g in groups}
@@ -177,7 +181,6 @@ def calculate_global_group_metrics(metrics_df, all_preds, all_targets):
                 results["R2"][grp][comp] = r2_score(t_clean, p_clean)
 
     # Construct DataFrame with Multi-level columns or flattened
-    # Flattened is easier for text file: R2_A, MSE_A, Var_A...
     final_rows = []
     for grp in groups:
         row = {}
@@ -189,7 +192,7 @@ def calculate_global_group_metrics(metrics_df, all_preds, all_targets):
 
     global_metrics = pd.concat(final_rows, axis=1).T
 
-    # Reorder columns to match sample-wise: R2_A, MSE_A, Var_A, R2_P...
+    # Reorder columns to match sample-wise
     ordered_cols = []
     for comp in components:
         ordered_cols.extend([f"R2_{comp}", f"MSE_{comp}", f"Var_{comp}"])
@@ -199,47 +202,16 @@ def calculate_global_group_metrics(metrics_df, all_preds, all_targets):
     return global_metrics
 
 
-def _calculate_per_sample_r2(preds, targets):
-    """Helper to calculate R^2 for each sample's vector (A, P, B0, B1)."""
-    n_samples = preds.shape[0]
-    r2_A, r2_P, r2_B0, r2_B1 = (
-        np.zeros(n_samples),
-        np.zeros(n_samples),
-        np.zeros(n_samples),
-        np.zeros(n_samples),
-    )
-
-    for i in range(n_samples):
-        for j, (arr_r2, comp_name) in enumerate(
-            [(r2_A, "A"), (r2_P, "P"), (r2_B0, "B0"), (r2_B1, "B1")]
-        ):
-            pred_sample = preds[i, j, :]
-            target_sample = targets[i, j, :]
-
-            mask = np.isfinite(pred_sample) & np.isfinite(target_sample)
-            if np.sum(mask) < 2:
-                arr_r2[i] = np.nan
-                continue
-
-            # Check for zero variance in target
-            if np.var(target_sample[mask]) < 1e-9:
-                arr_r2[i] = np.nan  # or 1.0 if pred == target, 0.0 otherwise
-            else:
-                arr_r2[i] = r2_score(target_sample[mask], pred_sample[mask])
-
-    return r2_A, r2_P, r2_B0, r2_B1
-
-
 def calculate_per_feature_metrics(all_preds_phys, all_targets_phys, quantiles):
     """
     Calculates R^2, MSE, and Target Variance for each individual feature
-    (e.g., Area at q=0.5) across all samples.
+    across all samples.
     """
     print("\nCalculating per-feature metrics (R^2, MSE, Var)...")
 
     n_samples, n_components, n_quantiles = all_preds_phys.shape
 
-    # Flatten from (N, 4, Q) to (N, 4*Q) for easier filtering
+    # Flatten from (N, 3, Q) to (N, 3*Q) for easier filtering
     preds_flat = all_preds_phys.reshape(n_samples, -1)
     targets_flat = all_targets_phys.reshape(n_samples, -1)
 
@@ -250,13 +222,12 @@ def calculate_per_feature_metrics(all_preds_phys, all_targets_phys, quantiles):
     if n_valid < n_samples:
         print(f"Warning: Filtering {n_samples - n_valid} samples with NaNs/Infs.")
 
-    # Define DataFrame structure
-    idx = pd.Index(["Area", "Perimeter", "B0", "B1"], name="Component")
+    # Define DataFrame structure (3 components)
+    idx = pd.Index(["Area", "Perimeter", "B0"], name="Component")
     cols = pd.Index(quantiles, name="Quantile (mm/hr)")
 
     if n_valid < 2:
         print("CRITICAL: Less than 2 valid samples. Returning NaN metrics.")
-        # Create empty/NaN DataFrames
         r2_matrix = pd.DataFrame(np.nan, index=idx, columns=cols)
         mse_matrix = pd.DataFrame(np.nan, index=idx, columns=cols)
         var_matrix = pd.DataFrame(np.nan, index=idx, columns=cols)
@@ -278,30 +249,23 @@ def calculate_per_feature_metrics(all_preds_phys, all_targets_phys, quantiles):
         }
 
     # --- Calculate Metrics ---
-
-    # R^2
-    # Suppress warnings for features with zero variance (R2 becomes 0 or NaN)
     with np.errstate(divide="ignore", invalid="ignore"):
         r2_raw = r2_score(
             targets_flat[mask], preds_flat[mask], multioutput="raw_values"
         )
 
-    # MSE
     mse_raw = mean_squared_error(
         targets_flat[mask], preds_flat[mask], multioutput="raw_values"
     )
 
-    # Target Variance
     var_raw = np.var(targets_flat[mask], axis=0)
 
     # --- Format as DataFrames ---
-    # Reshape back to (4, n_quantiles)
-    r2_matrix = pd.DataFrame(r2_raw.reshape(4, n_quantiles), index=idx, columns=cols)
-    mse_matrix = pd.DataFrame(mse_raw.reshape(4, n_quantiles), index=idx, columns=cols)
-    var_matrix = pd.DataFrame(var_raw.reshape(4, n_quantiles), index=idx, columns=cols)
+    # Reshape back to (3, n_quantiles)
+    r2_matrix = pd.DataFrame(r2_raw.reshape(3, n_quantiles), index=idx, columns=cols)
+    mse_matrix = pd.DataFrame(mse_raw.reshape(3, n_quantiles), index=idx, columns=cols)
+    var_matrix = pd.DataFrame(var_raw.reshape(3, n_quantiles), index=idx, columns=cols)
 
-    # --- Calculate Mean by Component ---
-    # We average across the quantiles (axis=1) to get a summary per component
     mean_by_component = pd.DataFrame(
         {
             "Avg_R2": r2_matrix.mean(axis=1),

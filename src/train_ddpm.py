@@ -16,6 +16,7 @@ import copy
 import matplotlib.colors as mcolors
 import sys
 import optuna
+import logging
 
 # --- Config & Path Setup ---
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -30,8 +31,6 @@ with open(config_path, "r") as file:
 from models.SR.ddpm.ddpm import ContextUnet
 from models.SR.ddpm.diffusion import Diffusion
 from data.dataset import DiffusionSRDataset
-from src.loss import MinkowskiLoss
-from src.utils import load_emulator
 
 PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
 DEM_DATA_DIR = config["DEM_DATA_DIR"]
@@ -39,19 +38,27 @@ DEM_STATS = config["DEM_STATS"]
 METADATA_TRAIN = config["TRAIN_METADATA_FILE"]
 METADATA_VAL = config["VAL_METADATA_FILE"]
 BATCH_SIZE = config["BATCH_SIZE"]
-LR = config["LEARNING_RATE"]
-WD = config["WEIGHT_DECAY"]
 EPOCHS = config["NUM_EPOCHS"]
 PATIENCE = config["PATIENCE"]
 NUM_WORKERS = config["NUM_WORKERS"]
-EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "DDPM_SR_Minkowski")
-N_QUANTILES = len(config["QUANTILE_LEVELS"])
+EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "DDPM_SR_Standard")
 
-# --- Minkowski Loss Configuration ---
-GEOMETRIC_WARMUP_EPOCHS = config.get("MINKOWSKI_WARMUP_EPOCHS", 5)
-GEOMETRIC_T_THRESHOLD = config.get("MINKOWSKI_T_THRESHOLD", 250)
-TRUST_TAU = config.get("TRUST_TAU", 0.1)
-EMULATOR_PATH = config.get("EMULATOR_CHECKPOINT_PATH", "checkpoints/emulator_best.pth")
+
+# --- Logger Setup ---
+def setup_base_logger():
+    logger = logging.getLogger("emulator_logger")
+    logger.setLevel(logging.DEBUG)
+
+    if not logger.hasHandlers():
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+    return logger
+
+
+logger = logging.getLogger("emulator_logger")
 
 
 class DataDenormalizer:
@@ -132,132 +139,78 @@ class EarlyStopping:
             setattr(self, k, v)
 
 
-def compute_geometric_loss_component(
-    diffusion,
-    emulator,
-    criterion,
-    denormalizer,
-    x_t,
-    predicted_noise,
-    t,
-    Y_clean_scaled,
-    Y_gamma_log,
-    compute_trust=True,
-):
-    loss_geom = torch.tensor(0.0, device=x_t.device)
-    avg_trust_val = 1.0
-
-    # x0 estimation from noisy x_t
-    alpha_hat_t = diffusion.alpha_hat[t][:, None, None, None]
-    sqrt_alpha_hat = torch.sqrt(alpha_hat_t)
-    sqrt_one_minus = torch.sqrt(1 - alpha_hat_t)
-    pred_x0_scaled = (x_t - sqrt_one_minus * predicted_noise) / (sqrt_alpha_hat + 1e-8)
-    pred_x0_scaled = torch.clamp(pred_x0_scaled, -1.0, 1.0)
-
-    # Time thresholding for geometric loss
-    mask_time = (t < GEOMETRIC_T_THRESHOLD).float()
-
-    if mask_time.sum() > 0:
-        batch_size = x_t.shape[0]
-        trust_weights = torch.ones(batch_size, device=x_t.device)
-
-        if compute_trust:
-            with torch.no_grad():
-                Y_norm = (Y_clean_scaled + 1.0) / 2.0
-                Y_phys = denormalizer.unnormalize_torch(Y_norm)
-                Y_phys = Y_phys * (Y_phys > 0.1).float()
-                gamma_truth_phys = emulator(Y_phys)
-                gamma_truth_log_pred = torch.log1p(gamma_truth_phys)
-                diff_trust = (gamma_truth_log_pred - Y_gamma_log).float()
-                emu_error_sq = diff_trust.pow(2).mean(
-                    dim=tuple(range(1, diff_trust.ndim))
-                )
-                trust_weights = torch.exp(-float(TRUST_TAU) * emu_error_sq)
-                avg_trust_val = trust_weights.mean().item()
-
-        # Scale back to log-physical space
-        pred_x0_norm = (pred_x0_scaled + 1.0) / 2.0
-        pred_x0_phys = denormalizer.unnormalize_torch(pred_x0_norm)
-        pred_x0_phys = pred_x0_phys * (pred_x0_phys > 0.1).float()
-        pred_gamma_phys = emulator(pred_x0_phys)
-        pred_gamma_log = torch.log1p(pred_gamma_phys)
-
-        # Handle 5-tuple return [B]
-        total_dist_b, _, _, _, _ = criterion(pred_gamma_log, Y_gamma_log)
-
-        # Apply trust and time masks [B]
-        weight_factor = trust_weights * mask_time
-        weighted_loss = total_dist_b * weight_factor
-        loss_geom = weighted_loss.sum() / (mask_time.sum() + 1e-8)
-
-    return loss_geom, avg_trust_val
-
-
 def save_sample_images(model, diffusion, loader, device, out_dir, epoch, denormalizer):
     model.eval()
-    selected_X, selected_Y = [], []
-    dry_count, wet_count, target_dry, target_wet = 0, 0, 1, 4
-    drizzle_threshold = 0.1
 
-    for X_batch, Y_batch, _ in loader:
-        X_batch, Y_batch = X_batch.to(device), Y_batch.to(device)
-        X_shifted = (X_batch[:, 0] + 1.0) / 2.0
-        X_phys = denormalizer.unnormalize_torch(X_shifted)
-        max_precip = X_phys.amax(dim=(1, 2))
+    # Retrieve the first batch
+    X_batch, Y_batch, *_ = next(iter(loader))
+    X_batch = X_batch.to(device, non_blocking=True)
+    Y_batch = Y_batch.to(device, non_blocking=True)
 
-        for i in range(X_batch.size(0)):
-            if max_precip[i] <= drizzle_threshold and dry_count < target_dry:
-                selected_X.append(X_batch[i : i + 1])
-                selected_Y.append(Y_batch[i : i + 1])
-                dry_count += 1
-            elif max_precip[i] > drizzle_threshold and wet_count < target_wet:
-                selected_X.append(X_batch[i : i + 1])
-                selected_Y.append(Y_batch[i : i + 1])
-                wet_count += 1
-            if dry_count == target_dry and wet_count == target_wet:
-                break
-        if dry_count == target_dry and wet_count == target_wet:
-            break
+    # DDPM data is scaled to [-1, 1], shift back to [0, 1] for unnormalization
+    X_shifted = (X_batch[:, 0] + 1.0) / 2.0
+    X_phys = denormalizer.unnormalize_torch(X_shifted)
+    total_precip = X_phys.sum(dim=(1, 2))
 
-    if not selected_X:
-        return
-    X_sample, Y_sample = torch.cat(selected_X, dim=0), torch.cat(selected_Y, dim=0)
-    n_samples = X_sample.size(0)
+    # Select the sample with the maximum total precipitation
+    max_idx = total_precip.argmax().item()
+    X_sample = X_batch[max_idx : max_idx + 1]
+    Y_sample = Y_batch[max_idx : max_idx + 1]
 
+    # Generate sample using DDIM
     with torch.no_grad():
-        with torch.amp.autocast("cuda"):
+        with torch.amp.autocast("cuda" if "cuda" in str(device) else "cpu"):
             x_generated = diffusion.sample_ddim(
-                model, n=n_samples, conditions=X_sample, ddim_steps=50
+                model, n=1, conditions=X_sample, ddim_steps=50
             )
 
-    X_norm = (X_sample[:, 0].cpu().numpy() + 1.0) / 2.0
-    Y_norm = (Y_sample[:, 0].cpu().numpy() + 1.0) / 2.0
-    Gen_norm = (x_generated[:, 0].cpu().clamp(-1.0, 1.0).numpy() + 1.0) / 2.0
-    X_p, Y_p, G_p = (
-        denormalizer.unnormalize(X_norm),
-        denormalizer.unnormalize(Y_norm),
-        denormalizer.unnormalize(Gen_norm),
+    # Shift tensors from [-1, 1] back to [0, 1] before unnormalizing
+    X_norm = (X_sample[:, 0].float().cpu().numpy() + 1.0) / 2.0
+    Y_norm = (Y_sample[:, 0].float().cpu().numpy() + 1.0) / 2.0
+    Gen_norm = (x_generated[:, 0].float().cpu().clamp(-1.0, 1.0).numpy() + 1.0) / 2.0
+
+    img_in = denormalizer.unnormalize(X_norm)[0]
+    img_target = denormalizer.unnormalize(Y_norm)[0]
+    img_gen = denormalizer.unnormalize(Gen_norm)[0]
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Save raw physical data
+    data_path = os.path.join(out_dir, f"sample_data_epoch_{epoch:03d}.npz")
+    np.savez_compressed(
+        data_path, img_in=img_in, img_target=img_target, img_gen=img_gen
     )
 
     precip_cmap = copy.copy(plt.get_cmap("Blues"))
     precip_cmap.set_bad(color="lightgrey", alpha=1.0)
 
-    fig, axs = plt.subplots(n_samples, 3, figsize=(18, 5 * n_samples), squeeze=False)
-    for i in range(n_samples):
-        vmax = max(np.nanmax(Y_p[i]), 1.0)
-        norm = mcolors.Normalize(vmin=0, vmax=vmax)
-        for j, (img, title) in enumerate(
-            zip([X_p[i], G_p[i], Y_p[i]], ["Input", "Generated", "Target"])
-        ):
-            m_img = img.copy()
-            m_img[m_img <= drizzle_threshold] = np.nan
-            im = axs[i, j].imshow(m_img, cmap=precip_cmap, norm=norm, origin="lower")
-            axs[i, j].set_title(f"{title} | Max: {np.nanmax(img):.2f}")
-            axs[i, j].axis("off")
-            if j == 2:
-                plt.colorbar(im, ax=axs[i, j], fraction=0.046, pad=0.04)
+    def mask_low_values(img, threshold=0.1):
+        masked = img.copy()
+        masked[masked <= threshold] = np.nan
+        return masked
+
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+    vmax = max(
+        np.nanmax([np.nanmax(img_in), np.nanmax(img_target), np.nanmax(img_gen)]), 1.0
+    )
+    norm = mcolors.Normalize(vmin=0, vmax=vmax)
+
+    axs[0].imshow(mask_low_values(img_in), cmap=precip_cmap, norm=norm, origin="lower")
+    axs[0].set_title(f"Input (LR) | Max: {np.nanmax(img_in):.2f}")
+    axs[0].axis("off")
+
+    axs[1].imshow(mask_low_values(img_gen), cmap=precip_cmap, norm=norm, origin="lower")
+    axs[1].set_title(f"Generated (SR) | Max: {np.nanmax(img_gen):.2f}")
+    axs[1].axis("off")
+
+    im3 = axs[2].imshow(
+        mask_low_values(img_target), cmap=precip_cmap, norm=norm, origin="lower"
+    )
+    axs[2].set_title(f"Target (HR) | Max: {np.nanmax(img_target):.2f}")
+    axs[2].axis("off")
+
+    plt.colorbar(im3, ax=axs[2], fraction=0.046, pad=0.04)
     plt.tight_layout()
-    os.makedirs(out_dir, exist_ok=True)
     plt.savefig(
         os.path.join(out_dir, f"sample_epoch_{epoch:03d}.png"),
         bbox_inches="tight",
@@ -278,15 +231,17 @@ def compute_physical_metrics(real_batch, gen_batch, drizzle_threshold=0.1):
 
 
 def run_training(args, trial=None):
-    device = "cuda"
-    torch.set_float32_matmul_precision("high")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        torch.set_float32_matmul_precision("high")
+
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_name = (
         f"{EXPERIMENT_NAME}_trial_{trial.number}_{timestamp}"
         if trial
         else f"{EXPERIMENT_NAME}_{timestamp}"
     )
-    out_dir = os.path.join("sr_experiment_runs", run_name)
+    out_dir = os.path.join("ci26_revision_runs", "sr_experiment_runs", run_name)
     os.makedirs(out_dir, exist_ok=True)
 
     with open(DEM_STATS, "r") as f:
@@ -295,13 +250,6 @@ def run_training(args, trial=None):
     denormalizer = DataDenormalizer(
         os.path.join(PREPROCESSED_DATA_DIR, "log_precip_max_val.npy")
     )
-
-    GEOMETRIC_TARGET_WEIGHT = (
-        args.geom_weight
-        if args.geom_weight is not None
-        else config.get("MINKOWSKI_TARGET_WEIGHT", 0.0)
-    )
-    print(f"Using geometric target weight: {GEOMETRIC_TARGET_WEIGHT:.4f}")
 
     train_ds = DiffusionSRDataset(
         PREPROCESSED_DATA_DIR,
@@ -328,103 +276,75 @@ def run_training(args, trial=None):
         val_ds, BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True
     )
 
-    geometric_criterion = MinkowskiLoss(config["QUANTILE_LEVELS"]).to(device)
-    emulator = load_emulator(EMULATOR_PATH, config, device)
-    emulator.eval()
-
     model = ContextUnet(in_channels=1, c_in_condition=2, device=device).to(device)
     diffusion = Diffusion(img_size=128, device=device)
 
-    current_lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True) if trial else LR
-    current_wd = (
-        trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True) if trial else WD
-    )
+    params_path = args.params_path
+    with open(params_path, "r") as file:
+        ddpm_params = yaml.safe_load(file)
+
+    if trial:
+        current_lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
+        current_wd = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+    else:
+        current_lr = ddpm_params["lr"]
+        current_wd = ddpm_params["weight_decay"]
+
     optimizer = optim.AdamW(model.parameters(), lr=current_lr, weight_decay=current_wd)
     mse_loss_fn = nn.MSELoss()
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=PATIENCE // 2
     )
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
     early_stopper = EarlyStopping(patience=PATIENCE, verbose=not bool(trial))
 
-    geometric_phase, geometric_start_epoch = False, None
+    best_val_mse = float("inf")
 
-    for epoch in range(EPOCHS):
+    for epoch in tqdm(range(EPOCHS), desc="Overall Training Progress"):
         model.train()
-        current_geom_weight = 0.0
-        if geometric_phase and geometric_start_epoch is not None:
-            current_geom_weight = GEOMETRIC_TARGET_WEIGHT * min(
-                1.0, (epoch - geometric_start_epoch) / float(GEOMETRIC_WARMUP_EPOCHS)
-            )
-
-        running_loss, running_geom, running_trust = 0.0, 0.0, 0.0
+        running_loss = 0.0
         pbar = tqdm(
             train_loader,
-            desc=f"Epoch {epoch+1}/{EPOCHS} [W={current_geom_weight:.4f}]",
-            disable=bool(trial),
+            desc=f"Epoch {epoch+1}/{EPOCHS}",
         )
 
-        for X, Y, Y_gamma in pbar:
-            X, Y, Y_gamma = X.to(device), Y.to(device), Y_gamma.to(device)
+        # Use *_ to unpack any potential extra returned values from the dataset (e.g. gamma targets)
+        for X, Y, *_ in pbar:
+            X, Y = X.to(device), Y.to(device)
             t = diffusion.sample_timesteps(X.shape[0])
             x_t, noise = diffusion.noise_images(Y, t)
 
             optimizer.zero_grad()
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast("cuda", enabled=(device == "cuda")):
                 pred_noise = model(x_t, t, X)
                 loss_mse = mse_loss_fn(noise, pred_noise)
-                loss_geom, trust_v = (
-                    compute_geometric_loss_component(
-                        diffusion,
-                        emulator,
-                        geometric_criterion,
-                        denormalizer,
-                        x_t,
-                        pred_noise,
-                        t,
-                        Y,
-                        Y_gamma,
-                    )
-                    if current_geom_weight > 0
-                    else (torch.tensor(0.0, device=device), 1.0)
-                )
-                total_loss = loss_mse + (current_geom_weight * loss_geom)
 
-            scaler.scale(total_loss).backward()
+            scaler.scale(loss_mse).backward()
             scaler.step(optimizer)
             scaler.update()
             running_loss += loss_mse.item()
-            running_geom += loss_geom.item()
-            running_trust += trust_v
 
         # Validation
         model.eval()
-        val_mse, val_geom = 0.0, 0.0
+        val_mse = 0.0
         with torch.no_grad():
-            for X, Y, Y_gamma in val_loader:
-                X, Y, Y_gamma = X.to(device), Y.to(device), Y_gamma.to(device)
+            for X, Y, *_ in val_loader:
+                X, Y = X.to(device), Y.to(device)
                 t = diffusion.sample_timesteps(X.shape[0])
                 x_t, noise = diffusion.noise_images(Y, t)
-                with torch.amp.autocast("cuda"):
+                with torch.amp.autocast("cuda", enabled=(device == "cuda")):
                     pred_n = model(x_t, t, X)
                     loss_m = mse_loss_fn(noise, pred_n)
-                    loss_g, _ = compute_geometric_loss_component(
-                        diffusion,
-                        emulator,
-                        geometric_criterion,
-                        denormalizer,
-                        x_t,
-                        pred_n,
-                        t,
-                        Y,
-                        Y_gamma,
-                        False,
-                    )
                 val_mse += loss_m.item()
-                val_geom += loss_g.item()
 
         avg_val_mse = val_mse / len(val_loader)
         scheduler.step(avg_val_mse)
+
+        # Save model weights
+        torch.save(model.state_dict(), os.path.join(out_dir, "ddpm_latest.pth"))
+        if avg_val_mse < best_val_mse:
+            best_val_mse = avg_val_mse
+            torch.save(model.state_dict(), os.path.join(out_dir, "ddpm_best.pth"))
 
         # Triggers and Checkpoints
         if (epoch + 1) % 5 == 0 or epoch == 0:
@@ -438,15 +358,17 @@ def run_training(args, trial=None):
                     epoch + 1,
                     denormalizer,
                 )
-            # Physical metric check for trigger
+
+            # Physical metric check for early stopping
             model.eval()
             wds = []
             with torch.no_grad():
-                for i, (Xv, Yv, _) in enumerate(val_loader):
+                for i, (Xv, Yv, *_) in enumerate(val_loader):
                     if i >= 10:
                         break
                     Xv, Yv = Xv.to(device), Yv.to(device)
-                    idx = torch.where(Xv[:, 0].amax(dim=(1, 2)) > 1e-6)[0]
+                    Xv_norm = (Xv[:, 0] + 1.0) / 2.0
+                    idx = torch.where(Xv_norm.amax(dim=(1, 2)) > 1e-6)[0]
                     if len(idx) == 0:
                         continue
                     gv = diffusion.sample_ddim(model, len(idx), Xv[idx], 50)
@@ -459,16 +381,8 @@ def run_training(args, trial=None):
 
             if wds:
                 mean_wd = np.mean(wds)
-                if early_stopper(mean_wd) and not geometric_phase:
-                    print(
-                        "!!! Convergence Reached. Triggering Geometric Curriculum !!!"
-                    )
-                    geometric_phase, geometric_start_epoch = True, epoch + 1
-                    early_stopper.reset()
-                    optimizer = optim.AdamW(
-                        model.parameters(), lr=current_lr * 0.1, weight_decay=current_wd
-                    )
-                elif early_stopper(mean_wd) and geometric_phase:
+                if early_stopper(mean_wd):
+                    print("Early stopping triggered. Convergence reached.")
                     break
 
         if trial:
@@ -484,17 +398,20 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--data_percentage", type=float, default=100.0)
     parser.add_argument("--tune", action="store_true")
-    parser.add_argument("--geom_weight", type=float, default=None)
+    parser.add_argument("--params_path", type=str, default=None)
     args = parser.parse_args()
+
     if args.tune:
+        logger.info("Starting Optuna ...")
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
         study = optuna.create_study(direction="minimize")
         study.optimize(lambda trial: run_training(args, trial), n_trials=10)
 
         # Dump best hyperparameters if tuning was performed
         if study.best_trial:
-            print("\nBest Hyperparameters:")
+            logger.info("\nBest Hyperparameters: ")
             for key, value in study.best_trial.params.items():
-                print(f"{key}: {value}")
+                logger.info(f"{key}: {value}")
             with open(os.path.join(parent_path, "ddpm_params.yaml"), "w") as f:
                 yaml.dump(study.best_trial.params, f)
     else:

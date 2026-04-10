@@ -16,11 +16,13 @@ class ZarrMixupDataset(Dataset):
         include_original=False,
         include_mixup=True,
         subset_fraction=1.0,
+        load_in_ram=False,
     ):
         self.zarr_path = zarr_path
         self.split = split
         self.scaler_val = float(scaler_val)
         self.augment = augment
+        self.load_in_ram = load_in_ram
 
         self.store = zarr.open(zarr_path, mode="r")
         if split not in self.store:
@@ -48,12 +50,45 @@ class ZarrMixupDataset(Dataset):
         self.total_len = self.cumulative_sizes[-1]
         self.indices_map = np.arange(self.total_len)
 
+        # 1. APPLY SUBSET FIRST
         if 0.0 < subset_fraction < 1.0:
             subset_size = int(self.total_len * subset_fraction)
             rng = np.random.default_rng(seed=42)
-            self.indices_map = rng.choice(
+            chosen_indices = rng.choice(
                 self.indices_map, size=max(1, subset_size), replace=False
             )
+            # Sort is required for Zarr orthogonal indexing below
+            self.indices_map = np.sort(chosen_indices)
+
+        # 2. LOAD RAM SELECTIVELY
+        if self.load_in_ram:
+            print(f"Loading subset of {split} dataset into RAM...")
+            self.data_arrays = []
+            self.target_arrays = []
+
+            for i in range(len(self.data_keys)):
+                # Identify which global indices map to this specific Zarr array
+                start_idx = 0 if i == 0 else self.cumulative_sizes[i - 1]
+                end_idx = self.cumulative_sizes[i]
+
+                # Filter indices for this array and shift to zero-based local index
+                mask = (self.indices_map >= start_idx) & (self.indices_map < end_idx)
+                local_indices = self.indices_map[mask] - start_idx
+
+                # Extract only the required subset directly into memory
+                self.data_arrays.append(
+                    self.group[self.data_keys[i]].oindex[local_indices]
+                )
+                self.target_arrays.append(
+                    self.group[self.target_keys[i]].oindex[local_indices]
+                )
+
+            # Overwrite indices_map so __getitem__ smoothly iterates over the new RAM arrays
+            self.indices_map = np.arange(len(self.indices_map))
+
+            # Re-calculate lengths based on the newly subsetted RAM arrays
+            self.lengths = [arr.shape[0] for arr in self.data_arrays]
+            self.cumulative_sizes = np.cumsum(self.lengths)
 
         if self.augment:
             self.transform = v2.Compose(
@@ -79,31 +114,28 @@ class ZarrMixupDataset(Dataset):
             else real_idx - self.cumulative_sizes[source_idx - 1]
         )
 
-        d_key = self.data_keys[source_idx]
-        t_key = self.target_keys[source_idx]
-
-        # Read specific index from zarr (Physical Units)
-        patch = self.group[d_key][local_idx].copy()
-        target_phys = self.group[t_key][local_idx].copy()
+        # Route data retrieval based on load_in_ram flag
+        if self.load_in_ram:
+            patch = self.data_arrays[source_idx][local_idx].copy()
+            target_phys = self.target_arrays[source_idx][local_idx].copy()
+        else:
+            d_key = self.data_keys[source_idx]
+            t_key = self.target_keys[source_idx]
+            patch = self.group[d_key][local_idx].copy()
+            target_phys = self.group[t_key][local_idx].copy()
 
         # Log transformation and [0, 1] normalization
-        # Note: the [0,1] scaling is done using the global max log-precip value computed during
-        # preprocessing on the original data, not the mixup data, to maintain consistency.
         patch_log = np.log1p(patch)
         patch_normalized = patch_log / self.scaler_val
         patch_normalized = np.clip(patch_normalized, 0.0, 1.0)
 
-        # Convert to PyTorch tensors
         input_tensor = torch.from_numpy(patch_normalized).float().unsqueeze(0)
         target_phys_tensor = torch.from_numpy(target_phys).float()
 
         if self.augment:
             input_tensor = self.transform(input_tensor)
 
-        # Gamma targets are log-transformed for the loss function evaluation
         log_target_gamma = torch.log1p(target_phys_tensor)
-
-        # TODO: remove one of the input tensors in the return statement to avoid redundancy, as both are the same physical patch data. For now, we return both for compatibility with existing training loops.
 
         return input_tensor, log_target_gamma, input_tensor, target_phys_tensor
 
@@ -304,22 +336,26 @@ class DiffusionSRDataset(Dataset):
             subset_size = max(int(total_samples * data_percentage / 100.0), 1)
             print(f"Subsetting {split} dataset to {data_percentage:.1f}%.")
             rng = np.random.default_rng(seed=42)
-            self.valid_indices = rng.choice(
+
+            # Select random indices
+            chosen_indices = rng.choice(
                 self.valid_indices, size=subset_size, replace=False
             )
+            # Zarr requires strictly increasing indices for .oindex extraction
+            self.valid_indices = np.sort(chosen_indices)
             print(f"Subset size: {len(self.valid_indices)} samples.")
         elif data_percentage <= 0.0 or data_percentage > 100.0:
             raise ValueError(
                 f"data_percentage must be in (0, 100]. Received {data_percentage}"
             )
 
-        # 3. Handle legacy gamma targets fallback
+        # 3. Handle legacy gamma targets fallback (Unchanged, but aligned to subset)
         gamma_path = os.path.join(
             self.preprocessed_data_dir, split, "gamma_targets_persistence.npz"
         )
         if not os.path.exists(gamma_path):
             self.legacy_gamma_targets = np.zeros(
-                (len(self.metadata), 3), dtype=np.float32
+                (len(self.valid_indices), 3), dtype=np.float32
             )
         else:
             self.legacy_gamma_targets = np.load(gamma_path, mmap_mode="r")["data"]
@@ -327,14 +363,24 @@ class DiffusionSRDataset(Dataset):
         # 4. Handle Data Loading (RAM vs Disk)
         if self.load_in_ram:
             print(
-                f"Loading {split} dataset entirely into RAM (this may take a moment)..."
+                f"Loading {split} dataset subset entirely into RAM (this may take a moment)..."
             )
             store = zarr.open(self.zarr_path, mode="r")
             group = store[self.split]
-            self.original_precip_ram = group["original_precip"][:]
-            self.interpolated_precip_ram = group["interpolated_precip"][:]
-            self.gamma_targets_ram = group["gamma_targets"][:]
-            self.dem_ram = group["dem"][:]
+
+            # Use .oindex to load ONLY the required subset into RAM
+            self.original_precip_ram = group["original_precip"].oindex[
+                self.valid_indices
+            ]
+            self.interpolated_precip_ram = group["interpolated_precip"].oindex[
+                self.valid_indices
+            ]
+            self.gamma_targets_ram = group["gamma_targets"].oindex[self.valid_indices]
+            self.dem_ram = group["dem"].oindex[self.valid_indices]
+
+            # Remap valid_indices so __getitem__ iterates from 0 to subset_size
+            # within these newly created, smaller RAM arrays.
+            self.valid_indices = np.arange(len(self.valid_indices))
         else:
             self.store = None
             self.group = None
